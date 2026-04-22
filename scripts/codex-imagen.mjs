@@ -8,9 +8,9 @@ import readline from "node:readline";
 
 const MACOS_CODEX_APP_BIN = "/Applications/Codex.app/Contents/Resources/codex";
 const DEFAULT_MODEL = "gpt-5.4";
-const DEFAULT_EFFORT = "xhigh";
+const DEFAULT_EFFORT = "medium";
 const DEFAULT_TIMEOUT_MS = 600_000;
-const VERSION = "0.1.2";
+const VERSION = "0.1.3";
 
 const IMAGE_FEATURE_CONFIG = {
   "features.enable_request_compression": true,
