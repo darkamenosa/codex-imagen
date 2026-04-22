@@ -26,7 +26,9 @@ Run the helper through Node for macOS, Linux, and Windows compatibility:
 node {baseDir}/scripts/codex-imagen.mjs 'can generate image follow this prompt, no refine? "a cinematic fantasy city at sunrise"'
 ```
 
-The command prints JSON. Use `images[].decodedPath` for the generated PNG/JPEG files and `images[].revisedPrompt` to inspect any prompt rewrite from the image tool.
+Normal generation prints one generated image path per line. This matches OpenClaw's artifact-oriented helper scripts, where stdout is the file handoff and diagnostics go to stderr.
+
+Use `--json` when you need the full machine-readable summary, including `images[].decodedPath`, `images[].revisedPrompt`, timing state, and app-server metadata.
 
 ## Runtime Checks
 

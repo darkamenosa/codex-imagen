@@ -10,7 +10,7 @@ const MACOS_CODEX_APP_BIN = "/Applications/Codex.app/Contents/Resources/codex";
 const DEFAULT_MODEL = "gpt-5.4";
 const DEFAULT_EFFORT = "xhigh";
 const DEFAULT_TIMEOUT_MS = 600_000;
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 
 const IMAGE_FEATURE_CONFIG = {
   "features.enable_request_compression": true,
@@ -45,6 +45,7 @@ Options:
   --imagegen-skill-path <path>   Optional explicit imagegen SKILL.md path.
   --cwd <path>                   Working directory for the Codex thread. Defaults to current directory.
   --out-dir <path>               Where decoded images are written.
+  --json                         Print the full machine-readable summary to stdout.
   --debug                        Write <out-dir>/codex-imagen.jsonl and diagnostics to stderr.
   --log <path>                   Write a redacted JSON-RPC log to this path.
   --model <id>                   Collaboration-mode model. Defaults to ${DEFAULT_MODEL}.
@@ -94,6 +95,7 @@ function parseArgs(rawArgv) {
     model: DEFAULT_MODEL,
     effort: DEFAULT_EFFORT,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    json: false,
     debug: false,
     smoke: false,
   };
@@ -124,6 +126,10 @@ function parseArgs(rawArgv) {
     }
     if (arg === "--debug") {
       opts.debug = true;
+      continue;
+    }
+    if (arg === "--json") {
+      opts.json = true;
       continue;
     }
     if (arg === "--") {
@@ -506,6 +512,7 @@ function finalizeOptions(raw) {
     logPath: logPath.path,
     logPathSource: logPath.source,
     debug: raw.debug || logPath.enabled,
+    json: raw.json,
     imagegenSkillPath: imagegenSkillPath.path,
     imagegenSkillPathSource: imagegenSkillPath.source,
     imagegenSkillPathChecked: imagegenSkillPath.checked,
@@ -770,6 +777,21 @@ function saveImageItem(item, outDir) {
   };
 }
 
+function imagePaths(state) {
+  return [...state.imageItems, ...state.rawImageItems].map((image) => image.decodedPath).filter(Boolean);
+}
+
+function printOutput(opts, summary, state = null) {
+  if (opts.json || opts.smoke) {
+    console.log(JSON.stringify(summary, null, 2));
+    return;
+  }
+  const paths = state ? imagePaths(state) : [];
+  for (const imagePath of paths) {
+    console.log(imagePath);
+  }
+}
+
 async function withTimeout(promise, timeoutMs, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -816,32 +838,26 @@ async function main() {
       const imagegenSkill = skills?.data
         ?.flatMap((entry) => entry.skills || [])
         .find((skill) => skill.name === "imagegen");
-      console.log(
-        JSON.stringify(
-          {
-            ok: true,
-            mode: "smoke",
-            codexBin: opts.codexBin,
-            codexBinSource: opts.codexBinSource,
-            userAgent: initialize.userAgent || null,
-            modelCount: models?.data?.length ?? null,
-            imagegenSkill: imagegenSkill
-              ? { name: imagegenSkill.name, path: imagegenSkill.path, enabled: imagegenSkill.enabled }
-              : null,
-            configuredImagegenSkillPath: opts.imagegenSkillPath,
-            usedSkillItem: Boolean(opts.imagegenSkillPath),
-            checkedImagegenSkillPaths: opts.imagegenSkillPathChecked,
-            outDir: opts.outDir,
-            outDirSource: opts.outDirSource,
-            logPath: opts.logPath,
-            logPathSource: opts.logPathSource,
-            debug: opts.debug,
-            warnings: opts.warnings,
-          },
-          null,
-          2,
-        ),
-      );
+      printOutput(opts, {
+        ok: true,
+        mode: "smoke",
+        codexBin: opts.codexBin,
+        codexBinSource: opts.codexBinSource,
+        userAgent: initialize.userAgent || null,
+        modelCount: models?.data?.length ?? null,
+        imagegenSkill: imagegenSkill
+          ? { name: imagegenSkill.name, path: imagegenSkill.path, enabled: imagegenSkill.enabled }
+          : null,
+        configuredImagegenSkillPath: opts.imagegenSkillPath,
+        usedSkillItem: Boolean(opts.imagegenSkillPath),
+        checkedImagegenSkillPaths: opts.imagegenSkillPathChecked,
+        outDir: opts.outDir,
+        outDirSource: opts.outDirSource,
+        logPath: opts.logPath,
+        logPathSource: opts.logPathSource,
+        debug: opts.debug,
+        warnings: opts.warnings,
+      });
       return;
     }
 
@@ -953,37 +969,34 @@ async function main() {
     const imageCount = state.imageItems.length + state.rawImageItems.length;
     const ok = state.errors.length === 0 && imageCount > 0;
 
-    console.log(
-      JSON.stringify(
-        {
-          ok,
-          timedOut,
-          timeoutMessage,
-          imageCount,
-          threadId: state.threadId,
-          turnId: state.turnId,
-          turnStatus: state.turn?.status || null,
-          images: state.imageItems,
-          rawImages: state.rawImageItems,
-          errors: state.errors,
-          agentMessages: state.agentMessages.filter(Boolean),
-          codexBin: opts.codexBin,
-          codexBinSource: opts.codexBinSource,
-          usedSkillItem: Boolean(opts.imagegenSkillPath),
-          imagegenSkillPath: opts.imagegenSkillPath,
-          outDir: opts.outDir,
-          outDirSource: opts.outDirSource,
-          logPath: opts.logPath,
-          logPathSource: opts.logPathSource,
-          debug: opts.debug,
-          warnings: opts.warnings,
-        },
-        null,
-        2,
-      ),
-    );
+    const summary = {
+      ok,
+      timedOut,
+      timeoutMessage,
+      imageCount,
+      threadId: state.threadId,
+      turnId: state.turnId,
+      turnStatus: state.turn?.status || null,
+      images: state.imageItems,
+      rawImages: state.rawImageItems,
+      errors: state.errors,
+      agentMessages: state.agentMessages.filter(Boolean),
+      codexBin: opts.codexBin,
+      codexBinSource: opts.codexBinSource,
+      usedSkillItem: Boolean(opts.imagegenSkillPath),
+      imagegenSkillPath: opts.imagegenSkillPath,
+      outDir: opts.outDir,
+      outDirSource: opts.outDirSource,
+      logPath: opts.logPath,
+      logPathSource: opts.logPathSource,
+      debug: opts.debug,
+      warnings: opts.warnings,
+    };
+    printOutput(opts, summary, state);
     if (timedOut) {
       process.exitCode = imageCount > 0 ? 4 : 124;
+    } else if (!ok) {
+      process.exitCode = 1;
     }
   } finally {
     await client.close();
