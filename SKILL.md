@@ -23,7 +23,7 @@ Generate images by starting `codex app-server`, sending a `$imagegen` turn, and 
 Run the helper through Node for macOS, Linux, and Windows compatibility:
 
 ```bash
-node {baseDir}/scripts/codex-imagen.mjs --prompt 'can generate image follow this prompt, no refine? "a cinematic fantasy city at sunrise"'
+node {baseDir}/scripts/codex-imagen.mjs 'can generate image follow this prompt, no refine? "a cinematic fantasy city at sunrise"'
 ```
 
 The command prints JSON. Use `images[].decodedPath` for the generated PNG/JPEG files and `images[].revisedPrompt` to inspect any prompt rewrite from the image tool.
@@ -76,7 +76,15 @@ When `--out-dir` is not set, the script chooses the first available location:
 4. `OPENCLAW_STATE_DIR/artifacts/codex-imagen`
 5. `./codex-imagen-output`
 
-The redacted app-server JSON-RPC log defaults to `<out-dir>/codex-imagen.jsonl`. Override with `--log` or `CODEX_IMAGEN_LOG`.
+Normal runs write image files only. They do not write `codex-imagen.jsonl`.
+
+Use `--debug` only when you need the redacted app-server JSON-RPC trace:
+
+```bash
+node {baseDir}/scripts/codex-imagen.mjs --debug "generate a small icon"
+```
+
+`--debug` writes `<out-dir>/codex-imagen.jsonl` and progress diagnostics to stderr. Use `--log /path/to/file.jsonl` or `CODEX_IMAGEN_LOG` when you need a specific trace path.
 
 ## Multiple Images
 

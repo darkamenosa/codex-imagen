@@ -34,8 +34,9 @@ class CliError extends Error {}
 function usage(exitCode = 0) {
   const text = `
 Usage:
-  node codex-imagen.mjs --prompt "make a small watercolor robot"
   node codex-imagen.mjs "make a small watercolor robot"
+  node codex-imagen.mjs --prompt "make a small watercolor robot"
+  node codex-imagen.mjs --debug "make a small watercolor robot"
 
 Options:
   --prompt <text>                Prompt for the image generation turn.
@@ -44,7 +45,8 @@ Options:
   --imagegen-skill-path <path>   Optional explicit imagegen SKILL.md path.
   --cwd <path>                   Working directory for the Codex thread. Defaults to current directory.
   --out-dir <path>               Where decoded images are written.
-  --log <path>                   Redacted JSON-RPC log path.
+  --debug                        Write <out-dir>/codex-imagen.jsonl and diagnostics to stderr.
+  --log <path>                   Write a redacted JSON-RPC log to this path.
   --model <id>                   Collaboration-mode model. Defaults to ${DEFAULT_MODEL}.
   --effort <effort>              Reasoning effort. Defaults to ${DEFAULT_EFFORT}.
   --timeout-ms <ms>              Turn timeout. Defaults to ${DEFAULT_TIMEOUT_MS}.
@@ -55,7 +57,7 @@ Options:
 Environment:
   CODEX_IMAGEN_CODEX_BIN         Preferred Codex binary path/name.
   CODEX_IMAGEN_OUT_DIR           Preferred output directory.
-  CODEX_IMAGEN_LOG               Preferred JSON-RPC log path.
+  CODEX_IMAGEN_LOG               Preferred JSON-RPC log path. Enables debug logging.
   CODEX_IMAGEN_SKILL_PATH        Preferred imagegen SKILL.md path.
   OPENCLAW_OUTPUT_DIR            OpenClaw-provided artifact directory, if set.
   OPENCLAW_AGENT_DIR             Used as <agent>/artifacts/codex-imagen when no output dir is set.
@@ -92,6 +94,7 @@ function parseArgs(rawArgv) {
     model: DEFAULT_MODEL,
     effort: DEFAULT_EFFORT,
     timeoutMs: DEFAULT_TIMEOUT_MS,
+    debug: false,
     smoke: false,
   };
   const rest = [];
@@ -117,6 +120,10 @@ function parseArgs(rawArgv) {
     }
     if (arg === "--smoke") {
       opts.smoke = true;
+      continue;
+    }
+    if (arg === "--debug") {
+      opts.debug = true;
       continue;
     }
     if (arg === "--") {
@@ -431,16 +438,19 @@ function resolveOutputDir(input) {
   return { path: path.resolve(process.cwd(), "codex-imagen-output"), source: "cwd" };
 }
 
-function resolveLogPath(input, outDir) {
+function resolveLogPath(input, outDir, debug) {
   const candidates = [
     ["--log", input],
     ["CODEX_IMAGEN_LOG", process.env.CODEX_IMAGEN_LOG],
   ].filter(([, value]) => value);
   if (candidates.length > 0) {
     const [source, value] = candidates[0];
-    return { path: resolveUserPath(value), source };
+    return { path: resolveUserPath(value), source, enabled: true };
   }
-  return { path: path.join(outDir, "codex-imagen.jsonl"), source: "out-dir" };
+  if (debug) {
+    return { path: path.join(outDir, "codex-imagen.jsonl"), source: "--debug", enabled: true };
+  }
+  return { path: null, source: null, enabled: false };
 }
 
 function resolveImagegenSkillPath(input) {
@@ -477,7 +487,7 @@ function resolveImagegenSkillPath(input) {
 function finalizeOptions(raw) {
   const codexBin = resolveCodexBin(raw.codexBinInput);
   const outDir = resolveOutputDir(raw.outDirInput);
-  const logPath = resolveLogPath(raw.logPathInput, outDir.path);
+  const logPath = resolveLogPath(raw.logPathInput, outDir.path, raw.debug);
   const imagegenSkillPath = resolveImagegenSkillPath(raw.imagegenSkillPathInput);
   const warnings = [];
 
@@ -495,6 +505,7 @@ function finalizeOptions(raw) {
     outDirSource: outDir.source,
     logPath: logPath.path,
     logPathSource: logPath.source,
+    debug: raw.debug || logPath.enabled,
     imagegenSkillPath: imagegenSkillPath.path,
     imagegenSkillPathSource: imagegenSkillPath.source,
     imagegenSkillPathChecked: imagegenSkillPath.checked,
@@ -574,6 +585,10 @@ function uniqueImagePath(outDir, stem, ext) {
   return candidate;
 }
 
+function debugLog(opts, message) {
+  if (opts.debug) console.error(`[codex-imagen] ${message}`);
+}
+
 class CodexAppServerClient {
   constructor(opts) {
     this.opts = opts;
@@ -583,8 +598,11 @@ class CodexAppServerClient {
     this.notifications = [];
     this.notificationHandler = null;
     this.closed = false;
-    fs.mkdirSync(path.dirname(opts.logPath), { recursive: true });
-    this.logStream = fs.createWriteStream(opts.logPath, { flags: "a", mode: 0o600 });
+    this.logStream = null;
+    if (opts.logPath) {
+      fs.mkdirSync(path.dirname(opts.logPath), { recursive: true });
+      this.logStream = fs.createWriteStream(opts.logPath, { flags: "a", mode: 0o600 });
+    }
   }
 
   start() {
@@ -627,6 +645,7 @@ class CodexAppServerClient {
   }
 
   writeLog(record) {
+    if (!this.logStream) return;
     this.logStream.write(`${JSON.stringify({ ts: new Date().toISOString(), ...scrub(record) })}\n`);
   }
 
@@ -711,7 +730,7 @@ class CodexAppServerClient {
     this.proc?.stdin?.end();
     if (this.proc && !this.proc.killed) this.proc.kill("SIGTERM");
     await new Promise((resolve) => setTimeout(resolve, 100));
-    this.logStream.end();
+    this.logStream?.end();
   }
 }
 
@@ -770,6 +789,9 @@ async function withTimeout(promise, timeoutMs, label) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   fs.mkdirSync(opts.outDir, { recursive: true });
+  debugLog(opts, `using Codex binary: ${opts.codexBin} (${opts.codexBinSource})`);
+  debugLog(opts, `writing images to: ${opts.outDir}`);
+  if (opts.logPath) debugLog(opts, `writing redacted app-server trace to: ${opts.logPath}`);
   const client = new CodexAppServerClient(opts);
   client.start();
 
@@ -813,6 +835,7 @@ async function main() {
             outDirSource: opts.outDirSource,
             logPath: opts.logPath,
             logPathSource: opts.logPathSource,
+            debug: opts.debug,
             warnings: opts.warnings,
           },
           null,
@@ -847,7 +870,9 @@ async function main() {
       } else if (msg.method === "item/completed") {
         const item = params.item || {};
         if (item.type === "imageGeneration") {
-          state.imageItems.push(saveImageItem(item, opts.outDir));
+          const saved = saveImageItem(item, opts.outDir);
+          state.imageItems.push(saved);
+          if (saved.decodedPath) debugLog(opts, `saved image: ${saved.decodedPath}`);
         } else if (item.type === "agentMessage" && typeof item.text === "string") {
           state.agentMessages.push(item.text);
         }
@@ -861,7 +886,9 @@ async function main() {
             revisedPrompt: item.revised_prompt ?? null,
             result: item.result,
           };
-          state.rawImageItems.push(saveImageItem(normalized, opts.outDir));
+          const saved = saveImageItem(normalized, opts.outDir);
+          state.rawImageItems.push(saved);
+          if (saved.decodedPath) debugLog(opts, `saved raw image: ${saved.decodedPath}`);
         }
       } else if (msg.method === "turn/completed") {
         state.completed = true;
@@ -921,6 +948,7 @@ async function main() {
       if (error?.code !== "TURN_TIMEOUT") throw error;
       timedOut = true;
       timeoutMessage = error.message;
+      debugLog(opts, timeoutMessage);
     }
     const imageCount = state.imageItems.length + state.rawImageItems.length;
     const ok = state.errors.length === 0 && imageCount > 0;
@@ -947,6 +975,7 @@ async function main() {
           outDirSource: opts.outDirSource,
           logPath: opts.logPath,
           logPathSource: opts.logPathSource,
+          debug: opts.debug,
           warnings: opts.warnings,
         },
         null,
