@@ -1,12 +1,14 @@
 # Codex Imagen
 
+[![CI](https://github.com/darkamenosa/codex-imagen/actions/workflows/ci.yml/badge.svg)](https://github.com/darkamenosa/codex-imagen/actions/workflows/ci.yml)
+
 OpenClaw skill and helper CLI for generating images through the local Codex app-server.
 
 This uses the machine's existing Codex/ChatGPT authentication and the built-in Codex `imagegen` skill. It does not require `OPENAI_API_KEY`.
 
 ## Requirements
 
-- Node.js
+- Node.js 18+
 - A working local Codex installation with `codex app-server`
 - Local Codex/ChatGPT auth on the machine
 
@@ -141,3 +143,17 @@ node scripts/codex-imagen.mjs --prompt-file prompt.txt
 ## Notes
 
 This is an experimental wrapper around Codex app-server behavior. It depends on the local Codex installation exposing compatible app-server and image generation features.
+
+## Development
+
+Run local static checks:
+
+```bash
+npm run check
+```
+
+The CI workflow only checks syntax and CLI help/version output. It does not call live Codex image generation because that requires local app auth.
+
+## License
+
+MIT

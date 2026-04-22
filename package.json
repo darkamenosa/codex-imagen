@@ -1,0 +1,32 @@
+{
+  "name": "codex-imagen",
+  "version": "0.1.3",
+  "private": true,
+  "description": "OpenClaw skill for generating images through the local Codex app-server.",
+  "homepage": "https://github.com/darkamenosa/codex-imagen#readme",
+  "bugs": {
+    "url": "https://github.com/darkamenosa/codex-imagen/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/darkamenosa/codex-imagen.git"
+  },
+  "author": "tuyenhx",
+  "type": "module",
+  "bin": {
+    "codex-imagen": "scripts/codex-imagen.mjs"
+  },
+  "scripts": {
+    "check": "node --check scripts/codex-imagen.mjs && node scripts/codex-imagen.mjs --version >/dev/null && node scripts/codex-imagen.mjs --help >/dev/null"
+  },
+  "keywords": [
+    "openclaw",
+    "codex",
+    "image-generation",
+    "skill"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}
