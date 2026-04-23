@@ -10,7 +10,7 @@ const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const DEFAULT_MODEL = "gpt-5.4";
 const DEFAULT_OPENCLAW_AGENT_ID = "main";
 const DEFAULT_CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
-const PACKAGE_VERSION = "0.2.3";
+const PACKAGE_VERSION = "0.2.4";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_REFRESH_SKEW_SECONDS = 60;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -1206,6 +1206,18 @@ function refreshFailureMessage(status, body) {
   return `Refresh request failed: HTTP ${status}: ${message}`;
 }
 
+function isRefreshTokenReusedResponse(status, body) {
+  return status === 401 && refreshErrorCode(body) === "refresh_token_reused";
+}
+
+function canUseExistingAccessAfterRefreshReuse(auth, reason) {
+  if (["forced refresh", "refresh-only", "401 from Codex backend"].includes(reason)) {
+    return false;
+  }
+  const secondsLeft = tokenSecondsLeft(auth.tokenPayload, auth.expiresMs);
+  return secondsLeft !== null && secondsLeft > 0;
+}
+
 async function writeAuthJsonAtomic(authPath, authJson) {
   await fs.mkdir(path.dirname(authPath), { recursive: true });
   const tempPath = path.join(
@@ -1352,7 +1364,7 @@ function skipRefreshAfterReload(originalAuth, currentAuth, options, reason) {
   return null;
 }
 
-async function refreshAuthUnlocked(options, auth, reason) {
+async function refreshAuthUnlocked(options, auth, reason, { retryRotatedRefreshToken = true } = {}) {
   logVerbose(options, `refresh: ${reason}`);
   logVerbose(options, `refresh_endpoint: ${options.refreshUrl}`);
 
@@ -1361,9 +1373,29 @@ async function refreshAuthUnlocked(options, auth, reason) {
   if (!response.ok) {
     const body = await response.text();
     const currentAuth = await readAuthWithOptions(auth.authPath, { authProfile: auth.profileId }).catch(() => null);
-    if (currentAuth?.refreshToken && currentAuth.refreshToken !== auth.refreshToken && !staleRefreshReason(currentAuth, options)) {
-      logVerbose(options, "refresh skipped: auth.json changed while refresh was in progress");
-      return { auth: currentAuth, refreshed: false, skipped: "auth changed" };
+    if (currentAuth && authCredentialsChanged(auth, currentAuth)) {
+      if (!staleRefreshReason(currentAuth, options)) {
+        logVerbose(options, "refresh skipped: auth.json changed while refresh was in progress");
+        return { auth: currentAuth, refreshed: false, skipped: "auth changed" };
+      }
+      if (
+        retryRotatedRefreshToken &&
+        isRefreshTokenReusedResponse(response.status, body) &&
+        currentAuth.refreshToken &&
+        currentAuth.refreshToken !== auth.refreshToken
+      ) {
+        logVerbose(options, "refresh retry: auth refresh token changed after refresh_token_reused");
+        return refreshAuthUnlocked(options, currentAuth, "refresh_token_reused with rotated refresh token", {
+          retryRotatedRefreshToken: false,
+        });
+      }
+    }
+    if (isRefreshTokenReusedResponse(response.status, body)) {
+      const fallbackAuth = currentAuth ?? auth;
+      if (canUseExistingAccessAfterRefreshReuse(fallbackAuth, reason)) {
+        logVerbose(options, "refresh skipped: refresh_token_reused but access token is still usable");
+        return { auth: fallbackAuth, refreshed: false, skipped: "refresh_token_reused; access token still valid" };
+      }
     }
     throw new Error(refreshFailureMessage(response.status, body));
   }

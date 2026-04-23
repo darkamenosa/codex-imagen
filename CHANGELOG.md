@@ -4,6 +4,12 @@ All notable changes to `codex-imagen` are recorded here.
 
 ## Unreleased
 
+## [0.2.4] - 2026-04-23
+
+### Fixed
+
+- Recover from `refresh_token_reused` before asking the user to sign in again: continue with a still-valid access token for proactive refresh failures, or retry once when another process rotated the stored refresh token but left the selected profile stale.
+
 ## [0.2.3] - 2026-04-23
 
 ### Changed
