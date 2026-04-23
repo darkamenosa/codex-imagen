@@ -2,6 +2,12 @@
 
 All notable changes to `codex-imagen` are recorded here.
 
+## [0.2.2] - 2026-04-23
+
+### Added
+
+- Added the project changelog and included it in the tagged GitHub release.
+
 ## [0.2.1] - 2026-04-23
 
 ### Added
