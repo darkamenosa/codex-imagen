@@ -606,12 +606,6 @@ function decodeJwtPayload(token) {
   }
 }
 
-async function readAuth(authPath) {
-  const raw = await fs.readFile(authPath, "utf8");
-  const auth = JSON.parse(raw);
-  return parseAuthJson(auth, authPath);
-}
-
 async function readAuthWithOptions(authPath, options) {
   const raw = await fs.readFile(authPath, "utf8");
   const auth = JSON.parse(raw);
@@ -973,18 +967,11 @@ async function buildPromptContent(options, prompt) {
     });
   }
 
-  return {
-    content,
-    metadata: refs.map((ref, index) => ({
-      index: index + 1,
-      label: localImageLabelText(index),
-      ...ref.metadata,
-    })),
-  };
+  return content;
 }
 
 async function buildResponsesBody(options, prompt, requestId) {
-  const promptContent = await buildPromptContent(options, prompt);
+  const content = await buildPromptContent(options, prompt);
   return {
     model: options.model,
     instructions: "",
@@ -992,7 +979,7 @@ async function buildResponsesBody(options, prompt, requestId) {
       {
         type: "message",
         role: "user",
-        content: promptContent.content,
+        content,
       },
     ],
     tools: [
@@ -1138,7 +1125,7 @@ function refreshedExpiresMs(refreshResponse) {
   return payload?.exp ? payload.exp * 1000 : null;
 }
 
-function mergeRefreshResponseForAuth(auth, currentAuth, refreshResponse) {
+function mergeRefreshResponseForAuth(currentAuth, refreshResponse) {
   if (currentAuth.authFormat === "codex-auth-json") {
     return mergeRefreshResponse(currentAuth.authJson, refreshResponse);
   }
@@ -1259,7 +1246,7 @@ async function refreshAuthUnlocked(options, auth, reason) {
     return { auth: currentAuth, refreshed: false, skipped: "auth changed" };
   }
 
-  const nextAuthJson = mergeRefreshResponseForAuth(auth, currentAuth, refreshResponse);
+  const nextAuthJson = mergeRefreshResponseForAuth(currentAuth, refreshResponse);
   await writeAuthJsonAtomic(auth.authPath, nextAuthJson);
   const nextAuth = await readAuthWithOptions(auth.authPath, { authProfile: currentAuth.profileId });
 
@@ -1549,7 +1536,6 @@ async function parseJsonResponse(response) {
   return {
     imageCalls: imageCallsFromPayload(payload, payloadType),
     seenEventTypes: [payloadType],
-    payload,
   };
 }
 
