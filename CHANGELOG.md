@@ -4,6 +4,12 @@ All notable changes to `codex-imagen` are recorded here.
 
 ## Unreleased
 
+## [0.2.5] - 2026-04-23
+
+### Fixed
+
+- Match OpenClaw's `refresh_token_reused` detection more closely by recognizing reused-refresh-token message text even when the OAuth response omits the structured error code.
+
 ## [0.2.4] - 2026-04-23
 
 ### Fixed

@@ -82,6 +82,17 @@ function reusedRefreshTokenResponse(response) {
   );
 }
 
+function reusedRefreshTokenMessageOnlyResponse(response) {
+  response.writeHead(401, { "content-type": "application/json" });
+  response.end(
+    JSON.stringify({
+      error: {
+        message: "Your refresh token has already been used to generate a new access token.",
+      },
+    })
+  );
+}
+
 function writeImageGenerationResponse(response) {
   const png =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
@@ -228,6 +239,71 @@ test("generation uses still-valid access token when proactive refresh gets refre
     const output = JSON.parse(result.stdout);
     assert.equal(output.image_count, 1);
     assert.equal(output.auth_refresh.refreshed, false);
+    assert.equal(output.auth_refresh.skipped, "refresh_token_reused; access token still valid");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("refresh_token_reused recovery also works when OAuth response only has message text", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-refresh-message-only-"));
+  const authPath = path.join(tempDir, "agent", "auth-profiles.json");
+  const stateDir = path.join(tempDir, "state");
+  const outDir = path.join(tempDir, "out");
+  const soonButValidAccess = jwtWithExpiry(Date.now() + 30_000);
+  await writeOpenClawAuthProfile(authPath, {
+    type: "oauth",
+    provider: "openai-codex",
+    access: soonButValidAccess,
+    refresh: "already-used-refresh-token",
+    expires: Date.now() + 30_000,
+    accountId: "acct_test",
+  });
+
+  let refreshRequests = 0;
+  let generationRequests = 0;
+  const server = createServer((request, response) => {
+    if (request.url === "/oauth/token") {
+      refreshRequests += 1;
+      reusedRefreshTokenMessageOnlyResponse(response);
+      return;
+    }
+    if (request.url === "/backend-api/codex/responses") {
+      generationRequests += 1;
+      writeImageGenerationResponse(response);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const result = await runCli(
+      [
+        "--auth",
+        authPath,
+        "--auth-profile",
+        "openai-codex:default",
+        "--refresh-url",
+        `http://127.0.0.1:${port}/oauth/token`,
+        "--base-url",
+        `http://127.0.0.1:${port}/backend-api/codex`,
+        "--out-dir",
+        outDir,
+        "--json",
+        "--quiet",
+        "--prompt",
+        "generate one test image",
+      ],
+      { OPENCLAW_STATE_DIR: stateDir }
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(refreshRequests, 1);
+    assert.equal(generationRequests, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.image_count, 1);
     assert.equal(output.auth_refresh.skipped, "refresh_token_reused; access token still valid");
   } finally {
     await new Promise((resolve) => server.close(resolve));

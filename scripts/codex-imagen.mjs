@@ -10,7 +10,7 @@ const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const DEFAULT_MODEL = "gpt-5.4";
 const DEFAULT_OPENCLAW_AGENT_ID = "main";
 const DEFAULT_CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
-const PACKAGE_VERSION = "0.2.4";
+const PACKAGE_VERSION = "0.2.5";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_REFRESH_SKEW_SECONDS = 60;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -1207,7 +1207,20 @@ function refreshFailureMessage(status, body) {
 }
 
 function isRefreshTokenReusedResponse(status, body) {
-  return status === 401 && refreshErrorCode(body) === "refresh_token_reused";
+  if (status !== 401) {
+    return false;
+  }
+
+  if (refreshErrorCode(body) === "refresh_token_reused") {
+    return true;
+  }
+
+  const text = String(body ?? "").toLowerCase();
+  return (
+    text.includes("refresh_token_reused") ||
+    text.includes("refresh token has already been used") ||
+    text.includes("already been used to generate a new access token")
+  );
 }
 
 function canUseExistingAccessAfterRefreshReuse(auth, reason) {
