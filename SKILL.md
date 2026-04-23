@@ -90,7 +90,9 @@ Local images are converted to `data:image/...;base64,...` and sent as `input_ima
 
 ## OAuth Refresh
 
-The CLI refreshes expired or near-expiry OAuth tokens through `https://auth.openai.com/oauth/token` and writes the updated token back to the same auth file. Use these controls when needed:
+The CLI refreshes expired or near-expiry OAuth tokens through `https://auth.openai.com/oauth/token` and writes the updated token back to the same auth file. For OpenClaw `auth-profiles.json`, refresh uses OpenClaw-compatible cross-agent OAuth refresh locking, then locks the auth store before rereading and writing credentials. This avoids `refresh_token_reused` races when multiple OpenClaw or agent processes share one `openai-codex` profile.
+
+Use these controls when needed:
 
 ```bash
 node {baseDir}/scripts/codex-imagen.mjs --refresh-only --json
@@ -98,11 +100,11 @@ node {baseDir}/scripts/codex-imagen.mjs --force-refresh --smoke --json
 node {baseDir}/scripts/codex-imagen.mjs --no-refresh --prompt 'generate one image'
 ```
 
-For concurrent OpenClaw processes, prefer the active OpenClaw agent's `auth-profiles.json` so every caller uses the same profile identity. A future OpenClaw-native wrapper can reuse OpenClaw's lock manager for refresh contention; this standalone helper uses atomic writes only.
+For concurrent OpenClaw processes, prefer the active OpenClaw agent's `auth-profiles.json` so every caller uses the same profile identity. Use `--no-refresh` only when the caller already owns OAuth refresh and wants this helper to use the provided access token as-is.
 
 ## Cross-Platform Notes
 
-The helper is plain Node.js 18+ with no native dependencies. It uses `os.homedir()` and environment overrides for Windows, Linux, and macOS. In `cmd.exe`, single quotes are not shell quotes; use double quotes or write UTF-8 text to a file and use:
+The helper is plain Node.js 22+ with no native dependencies. It uses `os.homedir()` and environment overrides for Windows, Linux, and macOS. In `cmd.exe`, single quotes are not shell quotes; use double quotes or write UTF-8 text to a file and use:
 
 ```bash
 node {baseDir}/scripts/codex-imagen.mjs --prompt-file prompt.txt

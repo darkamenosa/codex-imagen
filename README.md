@@ -8,7 +8,7 @@ It does not start `codex app-server`, does not require a Codex binary, and does 
 
 ## Requirements
 
-- Node.js 18+
+- Node.js 22+
 - Existing Codex or OpenClaw OAuth credentials on the machine
 
 Supported auth files:
@@ -103,15 +103,19 @@ The summary includes `image_count`, `images[].path`, `images[].decodedPath`, `im
 
 The CLI refreshes expired or near-expiry OAuth tokens with the OpenAI OAuth refresh endpoint and writes updates back to the same auth file.
 
+When the auth file is OpenClaw's `auth-profiles.json`, refresh uses the same cross-agent lock path OpenClaw uses for `openai-codex` OAuth profiles, then locks the auth store before rereading and writing credentials. That prevents concurrent agents from racing on one single-use refresh token and causing `refresh_token_reused`.
+
 ```bash
 node scripts/codex-imagen.mjs --refresh-only --json
 node scripts/codex-imagen.mjs --force-refresh --smoke --json
 node scripts/codex-imagen.mjs --no-refresh --prompt 'generate one image'
 ```
 
+Use `--no-refresh` only when the caller already owns token refresh. For normal standalone/OpenClaw skill usage, leave refresh enabled.
+
 ## Cross-Platform Notes
 
-The helper is plain Node.js and uses `os.homedir()`, `path`, and environment overrides instead of platform-specific shell behavior. It should work on macOS, Linux, and Windows.
+The helper is plain Node.js 22+ and uses `os.homedir()`, `path`, and environment overrides instead of platform-specific shell behavior. It should work on macOS, Linux, and Windows.
 
 In Windows `cmd.exe`, single quotes are not shell quotes, so use double quotes or `--prompt-file`:
 

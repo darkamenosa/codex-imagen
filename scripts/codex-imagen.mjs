@@ -16,6 +16,28 @@ const DEFAULT_REFRESH_SKEW_SECONDS = 60;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_IMAGE_DETAIL = "high";
 const LARGE_DATA_URL_WARNING_BYTES = 15 * 1024 * 1024;
+const FILE_LOCK_TIMEOUT_ERROR_CODE = "file_lock_timeout";
+const AUTH_STORE_LOCK_OPTIONS = {
+  retries: {
+    retries: 10,
+    factor: 2,
+    minTimeout: 100,
+    maxTimeout: 10_000,
+    randomize: true,
+  },
+  stale: 30_000,
+};
+const OAUTH_REFRESH_LOCK_OPTIONS = {
+  retries: {
+    retries: 20,
+    factor: 2,
+    minTimeout: 100,
+    maxTimeout: 10_000,
+    randomize: true,
+  },
+  stale: 180_000,
+};
+const OAUTH_REFRESH_CALL_TIMEOUT_MS = 120_000;
 
 class UsageError extends Error {
   constructor(message) {
@@ -308,6 +330,14 @@ function resolveOpenClawOAuthDir() {
   return path.join(resolveOpenClawStateDir(), "credentials");
 }
 
+function resolveOpenClawOAuthRefreshLockPath(provider, profileId) {
+  const hash = createHash("sha256");
+  hash.update(provider, "utf8");
+  hash.update("\u0000", "utf8");
+  hash.update(profileId, "utf8");
+  return path.join(resolveOpenClawStateDir(), "locks", "oauth-refresh", `sha256-${hash.digest("hex")}`);
+}
+
 function authPathCandidates() {
   const envCandidates = [
     process.env.CODEX_IMAGEN_AUTH_JSON,
@@ -401,6 +431,159 @@ function logVerbose(options, message) {
 function logProgress(options, message) {
   if (!options.quiet) {
     console.error(message);
+  }
+}
+
+const HELD_LOCKS = new Map();
+
+function releaseAllLocksSync() {
+  for (const [normalizedFile, held] of HELD_LOCKS) {
+    void held.handle.close().catch(() => undefined);
+    try {
+      fsSync.rmSync(held.lockPath, { force: true });
+    } catch {
+      // Best-effort process-exit cleanup.
+    }
+    HELD_LOCKS.delete(normalizedFile);
+  }
+}
+
+process.once("exit", releaseAllLocksSync);
+
+function computeDelayMs(retries, attempt) {
+  const base = Math.min(
+    retries.maxTimeout,
+    Math.max(retries.minTimeout, retries.minTimeout * retries.factor ** attempt)
+  );
+  const jitter = retries.randomize ? 1 + Math.random() : 1;
+  return Math.min(retries.maxTimeout, Math.round(base * jitter));
+}
+
+async function readLockPayload(lockPath) {
+  try {
+    const raw = await fs.readFile(lockPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed.pid !== "number" || typeof parsed.createdAt !== "string") {
+      return null;
+    }
+    return { pid: parsed.pid, createdAt: parsed.createdAt };
+  } catch {
+    return null;
+  }
+}
+
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+async function resolveNormalizedFilePath(filePath) {
+  const resolved = path.resolve(filePath);
+  const dir = path.dirname(resolved);
+  await fs.mkdir(dir, { recursive: true });
+  try {
+    const realDir = await fs.realpath(dir);
+    return path.join(realDir, path.basename(resolved));
+  } catch {
+    return resolved;
+  }
+}
+
+async function isStaleLock(lockPath, staleMs) {
+  const payload = await readLockPayload(lockPath);
+  if (payload?.pid && !isPidAlive(payload.pid)) {
+    return true;
+  }
+  if (payload?.createdAt) {
+    const createdAt = Date.parse(payload.createdAt);
+    if (!Number.isFinite(createdAt) || Date.now() - createdAt > staleMs) {
+      return true;
+    }
+  }
+  try {
+    const stat = await fs.stat(lockPath);
+    return Date.now() - stat.mtimeMs > staleMs;
+  } catch {
+    return true;
+  }
+}
+
+async function releaseHeldLock(normalizedFile) {
+  const current = HELD_LOCKS.get(normalizedFile);
+  if (!current) {
+    return;
+  }
+  current.count -= 1;
+  if (current.count > 0) {
+    return;
+  }
+  HELD_LOCKS.delete(normalizedFile);
+  await current.handle.close().catch(() => undefined);
+  await fs.rm(current.lockPath, { force: true }).catch(() => undefined);
+}
+
+function createFileLockTimeoutError(normalizedFile, lockPath) {
+  return Object.assign(new Error(`file lock timeout for ${normalizedFile}`), {
+    code: FILE_LOCK_TIMEOUT_ERROR_CODE,
+    lockPath,
+  });
+}
+
+async function acquireFileLock(filePath, options) {
+  const normalizedFile = await resolveNormalizedFilePath(filePath);
+  const lockPath = `${normalizedFile}.lock`;
+  const held = HELD_LOCKS.get(normalizedFile);
+  if (held) {
+    held.count += 1;
+    return {
+      lockPath,
+      release: () => releaseHeldLock(normalizedFile),
+    };
+  }
+
+  for (let attempt = 0; attempt <= options.retries.retries; attempt += 1) {
+    try {
+      const handle = await fs.open(lockPath, "wx");
+      await handle.writeFile(
+        JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }, null, 2),
+        "utf8"
+      );
+      HELD_LOCKS.set(normalizedFile, { count: 1, handle, lockPath });
+      return {
+        lockPath,
+        release: () => releaseHeldLock(normalizedFile),
+      };
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      if (await isStaleLock(lockPath, options.stale)) {
+        await fs.rm(lockPath, { force: true }).catch(() => undefined);
+        continue;
+      }
+      if (attempt >= options.retries.retries) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, computeDelayMs(options.retries, attempt)));
+    }
+  }
+
+  throw createFileLockTimeoutError(normalizedFile, lockPath);
+}
+
+async function withFileLock(filePath, options, fn) {
+  const lock = await acquireFileLock(filePath, options);
+  try {
+    return await fn();
+  } finally {
+    await lock.release();
   }
 }
 
@@ -537,6 +720,9 @@ function buildAuthResult(params) {
   const accessToken = profileAccess(params.profile);
   const refreshToken = profileRefresh(params.profile);
   const accountId = profileAccountId(params.profile);
+  const provider =
+    params.profile.provider ??
+    (params.profileId?.includes(":") ? params.profileId.split(":")[0] : "openai-codex");
 
   if (!accessToken) {
     throw new Error(`No access token found in ${params.authPath}`);
@@ -559,6 +745,7 @@ function buildAuthResult(params) {
     expiresMs,
     lastRefresh: params.lastRefresh ?? null,
     profileId: params.profileId ?? null,
+    provider,
     refreshToken,
     tokenPayload,
   };
@@ -878,18 +1065,19 @@ function refreshErrorCode(body) {
 
 function refreshFailureMessage(status, body) {
   const code = refreshErrorCode(body);
+  const signInAgain = "Sign in again with Codex or OpenClaw OAuth.";
 
   if (status === 401) {
     if (code === "refresh_token_expired") {
-      return "Refresh token expired. Run `codex logout` and sign in again.";
+      return `Refresh token expired. ${signInAgain}`;
     }
     if (code === "refresh_token_reused") {
-      return "Refresh token was already used. Run `codex logout` and sign in again.";
+      return `Refresh token was already used. ${signInAgain}`;
     }
     if (code === "refresh_token_invalidated") {
-      return "Refresh token was revoked. Run `codex logout` and sign in again.";
+      return `Refresh token was revoked. ${signInAgain}`;
     }
-    return "Refresh token was rejected. Run `codex logout` and sign in again.";
+    return `Refresh token was rejected. ${signInAgain}`;
   }
 
   const parsed = tryParseJson(body);
@@ -1000,32 +1188,64 @@ function mergeRefreshResponseForAuth(auth, currentAuth, refreshResponse) {
   return nextAuthJson;
 }
 
-async function refreshAuth(options, auth, reason) {
-  if (!options.refresh) {
-    throw new Error(`Codex OAuth refresh is disabled, but refresh is required: ${reason}`);
+async function postRefreshRequest(options, refreshToken) {
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), OAUTH_REFRESH_CALL_TIMEOUT_MS);
+  try {
+    return await fetch(options.refreshUrl, {
+      method: "POST",
+      headers: buildRefreshHeaders(),
+      body: JSON.stringify({
+        client_id: CODEX_OAUTH_CLIENT_ID,
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+      signal: abortController.signal,
+    });
+  } catch (error) {
+    if (abortController.signal.aborted) {
+      throw new Error(`OAuth refresh exceeded ${OAUTH_REFRESH_CALL_TIMEOUT_MS}ms.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function authCredentialsChanged(left, right) {
+  return (
+    left.accessToken !== right.accessToken ||
+    left.refreshToken !== right.refreshToken ||
+    left.expiresMs !== right.expiresMs ||
+    left.lastRefresh !== right.lastRefresh
+  );
+}
+
+function skipRefreshAfterReload(originalAuth, currentAuth, options, reason) {
+  const changed = authCredentialsChanged(originalAuth, currentAuth);
+  const fresh = !staleRefreshReason(currentAuth, options);
+
+  if (changed && fresh) {
+    return "auth changed";
   }
 
-  if (!auth.refreshToken) {
-    throw new Error(`No refresh token found in ${auth.authPath}`);
+  if (!["forced refresh", "refresh-only", "401 from Codex backend"].includes(reason) && fresh) {
+    return "already fresh";
   }
 
+  return null;
+}
+
+async function refreshAuthUnlocked(options, auth, reason) {
   logVerbose(options, `refresh: ${reason}`);
   logVerbose(options, `refresh_endpoint: ${options.refreshUrl}`);
 
-  const response = await fetch(options.refreshUrl, {
-    method: "POST",
-    headers: buildRefreshHeaders(),
-    body: JSON.stringify({
-      client_id: CODEX_OAUTH_CLIENT_ID,
-      grant_type: "refresh_token",
-      refresh_token: auth.refreshToken,
-    }),
-  });
+  const response = await postRefreshRequest(options, auth.refreshToken);
 
   if (!response.ok) {
     const body = await response.text();
     const currentAuth = await readAuthWithOptions(auth.authPath, { authProfile: auth.profileId }).catch(() => null);
-    if (currentAuth?.refreshToken && currentAuth.refreshToken !== auth.refreshToken) {
+    if (currentAuth?.refreshToken && currentAuth.refreshToken !== auth.refreshToken && !staleRefreshReason(currentAuth, options)) {
       logVerbose(options, "refresh skipped: auth.json changed while refresh was in progress");
       return { auth: currentAuth, refreshed: false, skipped: "auth changed" };
     }
@@ -1044,6 +1264,49 @@ async function refreshAuth(options, auth, reason) {
   const nextAuth = await readAuthWithOptions(auth.authPath, { authProfile: currentAuth.profileId });
 
   return { auth: nextAuth, refreshed: true, skipped: null };
+}
+
+async function refreshOpenClawAuthWithLocks(options, auth, reason) {
+  const provider = auth.provider || "openai-codex";
+  const refreshLockPath = resolveOpenClawOAuthRefreshLockPath(provider, auth.profileId);
+
+  logVerbose(options, `openclaw_refresh_lock: ${refreshLockPath}`);
+  logVerbose(options, `openclaw_auth_store_lock: ${auth.authPath}`);
+
+  try {
+    return await withFileLock(refreshLockPath, OAUTH_REFRESH_LOCK_OPTIONS, async () =>
+      withFileLock(auth.authPath, AUTH_STORE_LOCK_OPTIONS, async () => {
+        const currentAuth = await readAuthWithOptions(auth.authPath, { authProfile: auth.profileId });
+        const skipped = skipRefreshAfterReload(auth, currentAuth, options, reason);
+        if (skipped) {
+          logVerbose(options, `refresh skipped: ${skipped}`);
+          return { auth: currentAuth, refreshed: false, skipped };
+        }
+        return refreshAuthUnlocked(options, currentAuth, reason);
+      })
+    );
+  } catch (error) {
+    if (error?.code === FILE_LOCK_TIMEOUT_ERROR_CODE) {
+      throw new Error(`Timed out waiting for OpenClaw OAuth refresh lock: ${error.lockPath}`);
+    }
+    throw error;
+  }
+}
+
+async function refreshAuth(options, auth, reason) {
+  if (!options.refresh) {
+    throw new Error(`Codex OAuth refresh is disabled, but refresh is required: ${reason}`);
+  }
+
+  if (!auth.refreshToken) {
+    throw new Error(`No refresh token found in ${auth.authPath}`);
+  }
+
+  if (auth.authFormat === "openclaw-auth-profiles" && auth.profileId) {
+    return refreshOpenClawAuthWithLocks(options, auth, reason);
+  }
+
+  return refreshAuthUnlocked(options, auth, reason);
 }
 
 async function prepareAuth(options) {
@@ -1543,6 +1806,7 @@ function authSummary(auth, options) {
     auth_format: auth.authFormat,
     auth_mode: auth.authMode,
     profile_id: auth.profileId,
+    provider: auth.provider,
     account_id: auth.accountId,
     last_refresh: auth.lastRefresh,
     access_token_expires_in_seconds: tokenSecondsLeft(auth.tokenPayload, auth.expiresMs),

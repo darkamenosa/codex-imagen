@@ -25,8 +25,5 @@
     "image-generation",
     "skill"
   ],
-  "license": "MIT",
-  "engines": {
-    "node": ">=18"
-  }
+  "license": "MIT"
 }
