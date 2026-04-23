@@ -144,16 +144,19 @@ Profile selection for OpenClaw `auth-profiles.json`:
 
 1. `--auth-profile`
 2. `CODEX_IMAGEN_AUTH_PROFILE` or `OPENCLAW_AUTH_PROFILE`
-3. sibling `auth-state.json` `lastGood.openai-codex`
-4. best available `openai-codex` OAuth profile, preferring `openai-codex:default`, later expiry, email, and account id
+3. OpenClaw config `auth.order.openai-codex`, then configured `auth.profiles` for `openai-codex`
+4. sibling `auth-state.json` `lastGood.openai-codex`
+5. best available `openai-codex` OAuth profile, preferring `openai-codex:default`, later expiry, email, and account id
 
 Codex CLI is optional. If OpenClaw created the `openai-codex` OAuth profile through `openclaw onboard --auth-choice openai-codex` or `openclaw models auth login --provider openai-codex`, this helper can use that profile directly without installing Codex CLI. The helper reads and refreshes existing credentials; it does not run the first browser login itself.
 
 ## OAuth Refresh
 
-The CLI refreshes expired or near-expiry OAuth tokens with the OpenAI OAuth refresh endpoint and writes updates back to the same auth file. The default refresh skew is 60 seconds.
+The CLI refreshes expired or near-expiry OAuth tokens with the OpenAI OAuth refresh endpoint and writes updates back to the same auth file. The default refresh skew is 5 minutes, matching OpenClaw's OAuth usability margin.
 
-When the auth file is OpenClaw's `auth-profiles.json`, refresh uses the same cross-agent lock path OpenClaw uses for `openai-codex` OAuth profiles, then locks the auth store before rereading and writing credentials. That prevents concurrent agents from racing on one single-use refresh token and causing `refresh_token_reused`.
+When the auth file is OpenClaw's `auth-profiles.json`, refresh uses the same cross-agent lock path OpenClaw uses for `openai-codex` OAuth profiles, then locks the auth store before rereading and writing credentials. It also inherits a fresh matching profile from the main OpenClaw agent store when the current agent/workspace auth store is stale. That prevents concurrent agents from racing on one single-use refresh token and causing `refresh_token_reused`.
+
+When auth is auto-discovered and the first auth file is irrecoverably stale, the CLI tries the next compatible auth source, such as `CODEX_HOME/auth.json` or `~/.codex/auth.json`. Explicit `--auth` paths are not bypassed.
 
 ```bash
 node scripts/codex-imagen.mjs --refresh-only --json

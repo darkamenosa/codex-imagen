@@ -89,7 +89,7 @@ For OpenClaw, the current auth store is usually:
 
 Codex CLI is not required at runtime. The skill works with OAuth created by OpenClaw itself, for example `openclaw onboard --auth-choice openai-codex` or `openclaw models auth login --provider openai-codex`. It only needs an existing `openai-codex` OAuth profile; it does not perform the first browser login itself.
 
-`auth-state.json` beside it is used only to prefer OpenClaw's `lastGood.openai-codex` profile. Pass `--auth-profile openai-codex:<id>` when a specific OpenClaw profile should be used. The same value can come from `CODEX_IMAGEN_AUTH_PROFILE` or `OPENCLAW_AUTH_PROFILE`.
+Profile selection follows OpenClaw first: explicit `--auth-profile`, `CODEX_IMAGEN_AUTH_PROFILE` / `OPENCLAW_AUTH_PROFILE`, OpenClaw config `auth.order.openai-codex` or configured `auth.profiles`, then sibling `auth-state.json` `lastGood.openai-codex`. Pass `--auth-profile openai-codex:<id>` when a specific OpenClaw profile should be used.
 
 ## Output Paths
 
@@ -126,7 +126,9 @@ Local images are converted to `data:image/...;base64,...` and sent as `input_ima
 
 ## OAuth Refresh
 
-The CLI refreshes expired or near-expiry OAuth tokens through `https://auth.openai.com/oauth/token` and writes the updated token back to the same auth file. For OpenClaw `auth-profiles.json`, refresh uses OpenClaw-compatible cross-agent OAuth refresh locking, then locks the auth store before rereading and writing credentials. This avoids `refresh_token_reused` races when multiple OpenClaw or agent processes share one `openai-codex` profile.
+The CLI refreshes expired or near-expiry OAuth tokens through `https://auth.openai.com/oauth/token` and writes the updated token back to the same auth file. The default OAuth refresh skew is 5 minutes, matching OpenClaw's OAuth usability margin. For OpenClaw `auth-profiles.json`, refresh uses OpenClaw-compatible cross-agent OAuth refresh locking, then locks the auth store before rereading and writing credentials. It also inherits a fresh matching profile from the main OpenClaw agent store when the current agent/workspace auth store is stale. This avoids `refresh_token_reused` races when multiple OpenClaw or agent processes share one `openai-codex` profile.
+
+When auth is auto-discovered and the first auth file is irrecoverably stale, the CLI tries the next compatible auth source, such as `CODEX_HOME/auth.json` or `~/.codex/auth.json`. Explicit `--auth` paths are not bypassed.
 
 Use these controls when needed:
 

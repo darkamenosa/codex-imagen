@@ -10,9 +10,9 @@ const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const DEFAULT_MODEL = "gpt-5.4";
 const DEFAULT_OPENCLAW_AGENT_ID = "main";
 const DEFAULT_CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
-const PACKAGE_VERSION = "0.2.5";
+const PACKAGE_VERSION = "0.2.6";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
-const DEFAULT_REFRESH_SKEW_SECONDS = 60;
+const DEFAULT_REFRESH_SKEW_SECONDS = 5 * 60;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_OPENCLAW_TIMEOUT_MS = 5 * 60 * 1000;
 const FORCE_EXIT_AFTER_ABORT_MS = 10_000;
@@ -88,7 +88,8 @@ Options:
   --model <name>        Model slug. Default: ${DEFAULT_MODEL}
   --auth <path>         Auth JSON path. Supports Codex auth.json, OpenClaw auth-profiles.json,
                         OpenClaw agent/legacy auth.json, and OpenClaw credentials/oauth.json.
-  --auth-profile <id>   OpenClaw auth profile id. Default: auth-state lastGood, then best openai-codex OAuth profile.
+  --auth-profile <id>   OpenClaw auth profile id. Default: OpenClaw config/order,
+                        auth-state lastGood, then best openai-codex OAuth profile.
   --base-url <url>      Codex backend base URL. Default: ${DEFAULT_BASE_URL}
   --refresh-url <url>   OAuth refresh endpoint. Default: ${DEFAULT_REFRESH_URL}
   --cwd <path>          Resolve relative input/output paths from this working directory.
@@ -133,6 +134,8 @@ function parseArgs(argv) {
     imageDetail: DEFAULT_IMAGE_DETAIL,
     imagePaths: [],
     imageUrls: [],
+    authPathCandidates: [],
+    authPathExplicit: false,
     json: false,
     model: DEFAULT_MODEL,
     outDir: null,
@@ -219,8 +222,10 @@ function parseArgs(argv) {
       options.model = next();
     } else if (longValue("--auth") !== null) {
       options.authPath = longValue("--auth");
+      options.authPathExplicit = true;
     } else if (arg === "--auth") {
       options.authPath = next();
+      options.authPathExplicit = true;
     } else if (longValue("--auth-profile") !== null) {
       options.authProfile = longValue("--auth-profile");
     } else if (arg === "--auth-profile") {
@@ -429,12 +434,28 @@ function resolveOpenClawStateDir() {
   return current;
 }
 
+function resolveOpenClawConfigPath() {
+  const override = process.env.OPENCLAW_CONFIG_PATH?.trim();
+  if (override) {
+    return resolvePathFromCwd(override);
+  }
+  return path.join(resolveOpenClawStateDir(), "openclaw.json");
+}
+
 function resolveOpenClawAgentDir() {
   const override = process.env.OPENCLAW_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
   if (override) {
     return resolvePathFromCwd(override);
   }
+  return resolveOpenClawMainAgentDir();
+}
+
+function resolveOpenClawMainAgentDir() {
   return path.join(resolveOpenClawStateDir(), "agents", DEFAULT_OPENCLAW_AGENT_ID, "agent");
+}
+
+function resolveOpenClawMainAuthProfilePath() {
+  return path.join(resolveOpenClawMainAgentDir(), "auth-profiles.json");
 }
 
 function resolveOpenClawOAuthDir() {
@@ -521,6 +542,7 @@ function normalizeOptions(options) {
 
   options.outDir = options.outDir ? resolvePathFromCwd(options.outDir) : defaultOutputDir();
   options.authPath = resolveAuthPath(options);
+  options.authPathCandidates = options.authPathExplicit ? [options.authPath] : authPathCandidates();
   return options;
 }
 
@@ -750,6 +772,10 @@ function profileAccountId(profile) {
   return profile.accountId ?? profile.account_id ?? profile.account ?? null;
 }
 
+function profileEmail(profile) {
+  return profile.email ?? null;
+}
+
 function readSiblingAuthState(authPath) {
   const statePath = path.join(path.dirname(authPath), "auth-state.json");
   if (!existingFileSync(statePath)) {
@@ -762,8 +788,57 @@ function readSiblingAuthState(authPath) {
   }
 }
 
-function scoreOpenClawProfile(profileId, profile, state) {
+function readOpenClawConfig() {
+  const configPath = resolveOpenClawConfigPath();
+  if (!existingFileSync(configPath)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fsSync.readFileSync(configPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeProfileIdList(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((item) => (typeof item === "string" ? item.trim() : "")).filter(Boolean);
+}
+
+function providerFromProfileId(profileId) {
+  return profileId.includes(":") ? profileId.split(":")[0] : profileId;
+}
+
+function configuredOpenClawProfileOrder(config) {
+  const order = normalizeProfileIdList(config?.auth?.order?.["openai-codex"]);
+  const configuredProfiles = Object.entries(config?.auth?.profiles ?? {})
+    .filter(([profileId, profile]) => {
+      const provider =
+        typeof profile?.provider === "string" && profile.provider.trim()
+          ? profile.provider.trim()
+          : providerFromProfileId(profileId);
+      return provider === "openai-codex";
+    })
+    .map(([profileId]) => profileId);
+  return uniq([...order, ...configuredProfiles]);
+}
+
+function sameResolvedPath(left, right) {
+  return path.resolve(left) === path.resolve(right);
+}
+
+function shouldUseOpenClawConfigProfileOrder(authPath, options = {}) {
+  return !options.authPathExplicit || sameResolvedPath(authPath, resolveOpenClawMainAuthProfilePath());
+}
+
+function scoreOpenClawProfile(profileId, profile, state, configuredOrder = []) {
   let score = 0;
+  const configuredIndex = configuredOrder.indexOf(profileId);
+  if (configuredIndex !== -1) {
+    score += 500_000 - configuredIndex;
+  }
   const lastGood = state?.lastGood?.["openai-codex"];
   if (lastGood && profileId === lastGood) {
     score += 1_000_000;
@@ -792,6 +867,10 @@ function isUsableOpenClawCodexOAuthProfile(profile) {
   return isOpenClawCodexOAuthProfile(profile) && Boolean(profileAccess(profile)) && Boolean(profileAccountId(profile));
 }
 
+function isSelectableOpenClawCodexOAuthProfile(profile) {
+  return isOpenClawCodexOAuthProfile(profile) && Boolean(profileAccess(profile));
+}
+
 function selectOpenClawProfile(store, authPath, options = {}) {
   const profiles = store.profiles ?? {};
   const requested = options.authProfile?.trim();
@@ -804,8 +883,18 @@ function selectOpenClawProfile(store, authPath, options = {}) {
   }
 
   const state = readSiblingAuthState(authPath);
+  const configuredOrder = shouldUseOpenClawConfigProfileOrder(authPath, options)
+    ? configuredOpenClawProfileOrder(readOpenClawConfig())
+    : [];
+  for (const profileId of configuredOrder) {
+    const profile = profiles[profileId];
+    if (isSelectableOpenClawCodexOAuthProfile(profile)) {
+      return { profileId, profile };
+    }
+  }
+
   const lastGood = state?.lastGood?.["openai-codex"];
-  if (lastGood && isUsableOpenClawCodexOAuthProfile(profiles[lastGood])) {
+  if (lastGood && isSelectableOpenClawCodexOAuthProfile(profiles[lastGood])) {
     return { profileId: lastGood, profile: profiles[lastGood] };
   }
 
@@ -816,8 +905,8 @@ function selectOpenClawProfile(store, authPath, options = {}) {
   const rankedCandidates = usableCandidates.length > 0 ? usableCandidates : candidates;
   rankedCandidates.sort(
     ([leftId, leftProfile], [rightId, rightProfile]) =>
-      scoreOpenClawProfile(rightId, rightProfile, state) -
-      scoreOpenClawProfile(leftId, leftProfile, state)
+      scoreOpenClawProfile(rightId, rightProfile, state, configuredOrder) -
+      scoreOpenClawProfile(leftId, leftProfile, state, configuredOrder)
   );
 
   if (candidates.length === 0) {
@@ -843,6 +932,7 @@ function buildAuthResult(params) {
   const accessToken = profileAccess(params.profile);
   const refreshToken = profileRefresh(params.profile);
   const accountId = profileAccountId(params.profile);
+  const email = profileEmail(params.profile);
   const provider =
     params.profile.provider ??
     (params.profileId?.includes(":") ? params.profileId.split(":")[0] : "openai-codex");
@@ -865,6 +955,7 @@ function buildAuthResult(params) {
     authPath: params.authPath,
     authFormat: params.authFormat,
     authMode: params.authMode ?? null,
+    email,
     expiresMs,
     lastRefresh: params.lastRefresh ?? null,
     profileId: params.profileId ?? null,
@@ -1362,6 +1453,95 @@ function authCredentialsChanged(left, right) {
   );
 }
 
+function normalizeIdentityToken(value) {
+  const trimmed = typeof value === "string" ? value.trim() : "";
+  return trimmed || null;
+}
+
+function normalizeEmailToken(value) {
+  return normalizeIdentityToken(value)?.toLowerCase() ?? null;
+}
+
+function isSafeToAdoptOpenClawAuthIdentity(existingAuth, incomingAuth) {
+  const existingAccountId = normalizeIdentityToken(existingAuth.accountId);
+  const incomingAccountId = normalizeIdentityToken(incomingAuth.accountId);
+  if (existingAccountId && incomingAccountId) {
+    return existingAccountId === incomingAccountId;
+  }
+
+  const existingEmail = normalizeEmailToken(existingAuth.email);
+  const incomingEmail = normalizeEmailToken(incomingAuth.email);
+  if (existingEmail && incomingEmail) {
+    return existingEmail === incomingEmail;
+  }
+
+  if (existingAccountId || existingEmail) {
+    return false;
+  }
+
+  return true;
+}
+
+function areAuthIdentitiesCompatible(existingAuth, candidateAuth) {
+  return isSafeToAdoptOpenClawAuthIdentity(existingAuth, candidateAuth);
+}
+
+async function inheritFreshOpenClawMainAuth(options, auth) {
+  if (auth.authFormat !== "openclaw-auth-profiles" || !auth.profileId) {
+    return null;
+  }
+
+  const mainAuthPath = resolveOpenClawMainAuthProfilePath();
+  if (sameResolvedPath(mainAuthPath, auth.authPath) || !existingFileSync(mainAuthPath)) {
+    return null;
+  }
+
+  let mainAuth;
+  try {
+    mainAuth = await readAuthWithOptions(mainAuthPath, { ...options, authProfile: auth.profileId });
+  } catch (error) {
+    logVerbose(options, `main OpenClaw auth adoption skipped: ${error.message}`);
+    return null;
+  }
+
+  if (
+    mainAuth.authFormat !== "openclaw-auth-profiles" ||
+    mainAuth.profileId !== auth.profileId ||
+    mainAuth.provider !== auth.provider
+  ) {
+    return null;
+  }
+
+  if (!isSafeToAdoptOpenClawAuthIdentity(auth, mainAuth)) {
+    logVerbose(options, "main OpenClaw auth adoption skipped: identity mismatch");
+    return null;
+  }
+
+  if (staleRefreshReason(mainAuth, options)) {
+    return null;
+  }
+
+  if (!authCredentialsChanged(auth, mainAuth)) {
+    return null;
+  }
+
+  const sourceProfile = mainAuth.authJson.profiles?.[auth.profileId];
+  if (!sourceProfile) {
+    return null;
+  }
+
+  const nextAuthJson = structuredClone(auth.authJson);
+  if (!nextAuthJson.profiles || typeof nextAuthJson.profiles !== "object") {
+    return null;
+  }
+
+  nextAuthJson.profiles[auth.profileId] = structuredClone(sourceProfile);
+  await writeAuthJsonAtomic(auth.authPath, nextAuthJson);
+  const adoptedAuth = await readAuthWithOptions(auth.authPath, { ...options, authProfile: auth.profileId });
+  logVerbose(options, "refresh skipped: inherited fresh OpenClaw main auth");
+  return { auth: adoptedAuth, refreshed: false, skipped: "inherited fresh OpenClaw main auth" };
+}
+
 function skipRefreshAfterReload(originalAuth, currentAuth, options, reason) {
   const changed = authCredentialsChanged(originalAuth, currentAuth);
   const fresh = !staleRefreshReason(currentAuth, options);
@@ -1443,7 +1623,19 @@ async function refreshOpenClawAuthWithLocks(options, auth, reason) {
           logVerbose(options, `refresh skipped: ${skipped}`);
           return { auth: currentAuth, refreshed: false, skipped };
         }
-        return refreshAuthUnlocked(options, currentAuth, reason);
+        const inherited = await inheritFreshOpenClawMainAuth(options, currentAuth);
+        if (inherited) {
+          return inherited;
+        }
+        try {
+          return await refreshAuthUnlocked(options, currentAuth, reason);
+        } catch (error) {
+          const inheritedAfterFailure = await inheritFreshOpenClawMainAuth(options, currentAuth);
+          if (inheritedAfterFailure) {
+            return inheritedAfterFailure;
+          }
+          throw error;
+        }
       })
     );
   } catch (error) {
@@ -1470,8 +1662,34 @@ async function refreshAuth(options, auth, reason) {
   return refreshAuthUnlocked(options, auth, reason);
 }
 
-async function prepareAuth(options) {
-  let auth = await readAuthWithOptions(options.authPath, options);
+function attachAuthToError(error, auth) {
+  if (error && typeof error === "object") {
+    try {
+      Object.defineProperty(error, "auth", {
+        value: auth,
+        configurable: true,
+      });
+    } catch {
+      error.auth = auth;
+    }
+  }
+  return error;
+}
+
+function shouldTryNextAuthPath(error) {
+  const message = String(error?.message ?? error ?? "").toLowerCase();
+  return (
+    message.includes("refresh token was already used") ||
+    message.includes("refresh token expired") ||
+    message.includes("refresh token was revoked") ||
+    message.includes("refresh token was rejected") ||
+    message.includes("refresh request failed") ||
+    message.includes("no accountid found")
+  );
+}
+
+async function prepareAuthAtPath(options, authPath) {
+  let auth = await readAuthWithOptions(authPath, { ...options, authPath });
 
   if (auth.authMode && auth.authMode !== "chatgpt") {
     console.error(`warning: auth_mode is ${auth.authMode}, expected chatgpt.`);
@@ -1481,11 +1699,44 @@ async function prepareAuth(options) {
   const reason = options.forceRefresh ? "forced refresh" : staleRefreshReason(auth, options);
 
   if (reason) {
-    refresh = await refreshAuth(options, auth, reason);
+    try {
+      refresh = await refreshAuth({ ...options, authPath }, auth, reason);
+    } catch (error) {
+      throw attachAuthToError(error, auth);
+    }
     auth = refresh.auth;
   }
 
   return { auth, refresh };
+}
+
+async function prepareAuth(options) {
+  const candidates = uniq([options.authPath, ...(options.authPathCandidates ?? [])]).filter(existingFileSync);
+  let firstError = null;
+  let firstAuth = null;
+
+  for (const authPath of candidates) {
+    try {
+      const prepared = await prepareAuthAtPath(options, authPath);
+      if (firstAuth && !areAuthIdentitiesCompatible(firstAuth, prepared.auth)) {
+        logVerbose(options, `auth fallback skipped due to identity mismatch: ${authPath}`);
+        continue;
+      }
+      if (authPath !== options.authPath) {
+        logProgress(options, `codex-imagen: using fallback auth ${authPath}`);
+      }
+      return prepared;
+    } catch (error) {
+      firstError ??= error;
+      firstAuth ??= error?.auth ?? null;
+      if (options.authPathExplicit || !shouldTryNextAuthPath(error)) {
+        throw error;
+      }
+      logVerbose(options, `auth path failed, trying next candidate: ${authPath}: ${error.message}`);
+    }
+  }
+
+  throw firstError ?? new Error("No usable auth JSON found.");
 }
 
 function parseSseEvent(block) {
@@ -2203,6 +2454,7 @@ function authSummary(auth, options) {
     auth_mode: auth.authMode,
     profile_id: auth.profileId,
     provider: auth.provider,
+    email: auth.email ?? null,
     account_id: auth.accountId,
     last_refresh: auth.lastRefresh,
     access_token_expires_in_seconds: tokenSecondsLeft(auth.tokenPayload, auth.expiresMs),

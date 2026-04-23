@@ -14,10 +14,34 @@ function jwtWithExpiry(expiresMs) {
 }
 
 async function writeOpenClawAuthProfile(authPath, profile) {
+  await writeOpenClawAuthProfiles(authPath, { "openai-codex:default": profile });
+}
+
+async function writeOpenClawAuthProfiles(authPath, profiles) {
   await fs.mkdir(path.dirname(authPath), { recursive: true });
   await fs.writeFile(
     authPath,
-    `${JSON.stringify({ version: 1, profiles: { "openai-codex:default": profile } }, null, 2)}\n`,
+    `${JSON.stringify({ version: 1, profiles }, null, 2)}\n`,
+    "utf8"
+  );
+}
+
+async function writeCodexAuthJson(codexHome, tokens) {
+  await fs.mkdir(codexHome, { recursive: true });
+  await fs.writeFile(
+    path.join(codexHome, "auth.json"),
+    `${JSON.stringify(
+      {
+        auth_mode: "chatgpt",
+        tokens: {
+          access_token: tokens.access,
+          refresh_token: tokens.refresh,
+          account_id: tokens.accountId,
+        },
+      },
+      null,
+      2
+    )}\n`,
     "utf8"
   );
 }
@@ -43,6 +67,116 @@ async function runCli(args, env = {}) {
   const code = await new Promise((resolve) => child.on("close", resolve));
   return { code, stdout, stderr };
 }
+
+test("smoke prefers OpenClaw configured openai-codex profile over default", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-active-openclaw-profile-"));
+  const stateDir = path.join(tempDir, "state");
+  const authPath = path.join(stateDir, "agents", "main", "agent", "auth-profiles.json");
+  const configuredProfileId = "openai-codex:hxtxmu@gmail.com";
+
+  await writeOpenClawAuthProfiles(authPath, {
+    "openai-codex:default": {
+      type: "oauth",
+      provider: "openai-codex",
+      access: jwtWithExpiry(Date.now() - 20 * 24 * 60 * 60_000),
+      refresh: "stale-default-refresh-token",
+      expires: Date.now() - 20 * 24 * 60 * 60_000,
+      accountId: "acct_test",
+    },
+    [configuredProfileId]: {
+      type: "oauth",
+      provider: "openai-codex",
+      access: jwtWithExpiry(Date.now() + 60 * 60_000),
+      refresh: "fresh-configured-refresh-token",
+      expires: Date.now() + 60 * 60_000,
+      accountId: "acct_test",
+      email: "hxtxmu@gmail.com",
+    },
+  });
+  await fs.writeFile(
+    path.join(stateDir, "openclaw.json"),
+    `${JSON.stringify(
+      {
+        auth: {
+          profiles: {
+            [configuredProfileId]: { provider: "openai-codex" },
+          },
+        },
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = await runCli(["--smoke", "--json"], {
+    OPENCLAW_STATE_DIR: stateDir,
+    OPENCLAW_AGENT_DIR: "",
+    PI_CODING_AGENT_DIR: "",
+    CODEX_IMAGEN_AUTH_JSON: "",
+    OPENCLAW_CODEX_AUTH_JSON: "",
+    CODEX_AUTH_JSON: "",
+    CODEX_HOME: path.join(tempDir, "missing-codex-home"),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.profile_id, configuredProfileId);
+  assert.equal(output.email, "hxtxmu@gmail.com");
+  assert.ok(output.access_token_expires_in_seconds > 0);
+});
+
+test("explicit custom auth path is not reordered by unrelated OpenClaw config", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-explicit-auth-profile-order-"));
+  const stateDir = path.join(tempDir, "state");
+  const authPath = path.join(tempDir, "custom", "auth-profiles.json");
+  const configuredProfileId = "openai-codex:hxtxmu@gmail.com";
+
+  await writeOpenClawAuthProfiles(authPath, {
+    "openai-codex:default": {
+      type: "oauth",
+      provider: "openai-codex",
+      access: jwtWithExpiry(Date.now() + 60 * 60_000),
+      refresh: "fresh-default-refresh-token",
+      expires: Date.now() + 60 * 60_000,
+      accountId: "acct_test",
+    },
+    [configuredProfileId]: {
+      type: "oauth",
+      provider: "openai-codex",
+      access: jwtWithExpiry(Date.now() + 60 * 60_000),
+      refresh: "fresh-configured-refresh-token",
+      expires: Date.now() + 60 * 60_000,
+      accountId: "acct_test",
+      email: "hxtxmu@gmail.com",
+    },
+  });
+  await fs.mkdir(stateDir, { recursive: true });
+  await fs.writeFile(
+    path.join(stateDir, "openclaw.json"),
+    `${JSON.stringify(
+      {
+        auth: {
+          profiles: {
+            [configuredProfileId]: { provider: "openai-codex" },
+          },
+        },
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const result = await runCli(["--auth", authPath, "--smoke", "--json"], {
+    OPENCLAW_STATE_DIR: stateDir,
+    CODEX_HOME: path.join(tempDir, "missing-codex-home"),
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  const output = JSON.parse(result.stdout);
+  assert.equal(output.profile_id, "openai-codex:default");
+});
 
 async function withRefreshServer(handler, fn) {
   let requests = 0;
@@ -226,7 +360,6 @@ test("generation uses still-valid access token when proactive refresh gets refre
         "--out-dir",
         outDir,
         "--json",
-        "--quiet",
         "--prompt",
         "generate one test image",
       ],
@@ -305,6 +438,251 @@ test("refresh_token_reused recovery also works when OAuth response only has mess
     const output = JSON.parse(result.stdout);
     assert.equal(output.image_count, 1);
     assert.equal(output.auth_refresh.skipped, "refresh_token_reused; access token still valid");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("generation inherits fresh main OpenClaw auth after refresh_token_reused", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-refresh-main-adopt-"));
+  const stateDir = path.join(tempDir, "state");
+  const authPath = path.join(stateDir, "agents", "sub", "agent", "auth-profiles.json");
+  const mainAuthPath = path.join(stateDir, "agents", "main", "agent", "auth-profiles.json");
+  const outDir = path.join(tempDir, "out");
+  const expiredAccess = jwtWithExpiry(Date.now() - 60_000);
+  const freshMainAccess = jwtWithExpiry(Date.now() + 60 * 60_000);
+  await writeOpenClawAuthProfile(authPath, {
+    type: "oauth",
+    provider: "openai-codex",
+    access: expiredAccess,
+    refresh: "already-used-refresh-token",
+    expires: Date.now() - 60_000,
+    accountId: "acct_test",
+  });
+
+  let refreshRequests = 0;
+  let generationRequests = 0;
+  const server = createServer(async (request, response) => {
+    if (request.url === "/oauth/token") {
+      refreshRequests += 1;
+      await writeOpenClawAuthProfile(mainAuthPath, {
+        type: "oauth",
+        provider: "openai-codex",
+        access: freshMainAccess,
+        refresh: "fresh-main-refresh-token",
+        expires: Date.now() + 60 * 60_000,
+        accountId: "acct_test",
+      });
+      reusedRefreshTokenResponse(response);
+      return;
+    }
+    if (request.url === "/backend-api/codex/responses") {
+      generationRequests += 1;
+      writeImageGenerationResponse(response);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const result = await runCli(
+      [
+        "--auth",
+        authPath,
+        "--auth-profile",
+        "openai-codex:default",
+        "--refresh-url",
+        `http://127.0.0.1:${port}/oauth/token`,
+        "--base-url",
+        `http://127.0.0.1:${port}/backend-api/codex`,
+        "--out-dir",
+        outDir,
+        "--json",
+        "--quiet",
+        "--prompt",
+        "generate one test image",
+      ],
+      { OPENCLAW_STATE_DIR: stateDir }
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(refreshRequests, 1);
+    assert.equal(generationRequests, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.image_count, 1);
+    assert.equal(output.auth_refresh.refreshed, false);
+    assert.equal(output.auth_refresh.skipped, "inherited fresh OpenClaw main auth");
+    const persisted = await readOpenClawAuthProfile(authPath);
+    assert.equal(persisted.access, freshMainAccess);
+    assert.equal(persisted.refresh, "fresh-main-refresh-token");
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("generation falls back from dead auto-selected OpenClaw auth to fresh Codex auth", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-auth-fallback-"));
+  const stateDir = path.join(tempDir, "state");
+  const codexHome = path.join(tempDir, "codex-home");
+  const authPath = path.join(stateDir, "agents", "main", "agent", "auth-profiles.json");
+  const outDir = path.join(tempDir, "out");
+  const expiredAccess = jwtWithExpiry(Date.now() - 20 * 24 * 60 * 60_000);
+  const freshCodexAccess = jwtWithExpiry(Date.now() + 60 * 60_000);
+  await writeOpenClawAuthProfile(authPath, {
+    type: "oauth",
+    provider: "openai-codex",
+    access: expiredAccess,
+    refresh: "already-used-openclaw-refresh-token",
+    expires: Date.now() - 20 * 24 * 60 * 60_000,
+    accountId: "acct_test",
+  });
+  await writeCodexAuthJson(codexHome, {
+    access: freshCodexAccess,
+    refresh: "fresh-codex-refresh-token",
+    accountId: "acct_test",
+  });
+
+  let refreshRequests = 0;
+  let generationRequests = 0;
+  const server = createServer((request, response) => {
+    if (request.url === "/oauth/token") {
+      refreshRequests += 1;
+      reusedRefreshTokenResponse(response);
+      return;
+    }
+    if (request.url === "/backend-api/codex/responses") {
+      generationRequests += 1;
+      writeImageGenerationResponse(response);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const result = await runCli(
+      [
+        "--refresh-url",
+        `http://127.0.0.1:${port}/oauth/token`,
+        "--base-url",
+        `http://127.0.0.1:${port}/backend-api/codex`,
+        "--out-dir",
+        outDir,
+        "--json",
+        "--quiet",
+        "--prompt",
+        "generate one test image",
+      ],
+      {
+        CODEX_HOME: codexHome,
+        OPENCLAW_STATE_DIR: stateDir,
+        OPENCLAW_AGENT_DIR: "",
+        PI_CODING_AGENT_DIR: "",
+        CODEX_IMAGEN_AUTH_JSON: "",
+        OPENCLAW_CODEX_AUTH_JSON: "",
+        CODEX_AUTH_JSON: "",
+      }
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(refreshRequests, 1);
+    assert.equal(generationRequests, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.image_count, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("generation falls back when active OpenClaw profile lacks accountId", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-active-missing-account-"));
+  const stateDir = path.join(tempDir, "state");
+  const codexHome = path.join(tempDir, "codex-home");
+  const authPath = path.join(stateDir, "agents", "main", "agent", "auth-profiles.json");
+  const outDir = path.join(tempDir, "out");
+  const configuredProfileId = "openai-codex:hxtxmu@gmail.com";
+  const freshAccess = jwtWithExpiry(Date.now() + 60 * 60_000);
+  await writeOpenClawAuthProfiles(authPath, {
+    "openai-codex:default": {
+      type: "oauth",
+      provider: "openai-codex",
+      access: jwtWithExpiry(Date.now() - 20 * 24 * 60 * 60_000),
+      refresh: "already-used-openclaw-refresh-token",
+      expires: Date.now() - 20 * 24 * 60 * 60_000,
+      accountId: "acct_test",
+    },
+    [configuredProfileId]: {
+      type: "oauth",
+      provider: "openai-codex",
+      access: freshAccess,
+      refresh: "fresh-active-refresh-token",
+      expires: Date.now() + 60 * 60_000,
+      email: "hxtxmu@gmail.com",
+    },
+  });
+  await fs.writeFile(
+    path.join(stateDir, "openclaw.json"),
+    `${JSON.stringify(
+      {
+        auth: {
+          profiles: {
+            [configuredProfileId]: { provider: "openai-codex" },
+          },
+        },
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+  await writeCodexAuthJson(codexHome, {
+    access: jwtWithExpiry(Date.now() + 60 * 60_000),
+    refresh: "fresh-codex-refresh-token",
+    accountId: "acct_test",
+  });
+
+  let generationRequests = 0;
+  const server = createServer((request, response) => {
+    if (request.url === "/backend-api/codex/responses") {
+      generationRequests += 1;
+      writeImageGenerationResponse(response);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const result = await runCli(
+      [
+        "--base-url",
+        `http://127.0.0.1:${port}/backend-api/codex`,
+        "--out-dir",
+        outDir,
+        "--json",
+        "--quiet",
+        "--prompt",
+        "generate one test image",
+      ],
+      {
+        CODEX_HOME: codexHome,
+        OPENCLAW_STATE_DIR: stateDir,
+        OPENCLAW_AGENT_DIR: "",
+        PI_CODING_AGENT_DIR: "",
+        CODEX_IMAGEN_AUTH_JSON: "",
+        OPENCLAW_CODEX_AUTH_JSON: "",
+        CODEX_AUTH_JSON: "",
+      }
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(generationRequests, 1);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.image_count, 1);
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
