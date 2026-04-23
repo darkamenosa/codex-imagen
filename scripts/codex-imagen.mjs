@@ -1,1014 +1,1668 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from "node:child_process";
-import fs from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import fsSync, { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import readline from "node:readline";
 
-const MACOS_CODEX_APP_BIN = "/Applications/Codex.app/Contents/Resources/codex";
+const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex";
+const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const DEFAULT_MODEL = "gpt-5.4";
-const DEFAULT_EFFORT = "medium";
-const DEFAULT_TIMEOUT_MS = 600_000;
-const VERSION = "0.1.3";
+const DEFAULT_OPENCLAW_AGENT_ID = "main";
+const DEFAULT_CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
+const PACKAGE_VERSION = "0.2.0";
+const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const DEFAULT_REFRESH_SKEW_SECONDS = 60;
+const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_IMAGE_DETAIL = "high";
+const LARGE_DATA_URL_WARNING_BYTES = 15 * 1024 * 1024;
 
-const IMAGE_FEATURE_CONFIG = {
-  "features.enable_request_compression": true,
-  "features.collaboration_modes": true,
-  "features.personality": true,
-  "features.fast_mode": true,
-  "features.image_generation": true,
-  "features.image_detail_original": true,
-  "features.apps": true,
-  "features.plugins": true,
-  "features.tool_search": true,
-  "features.tool_suggest": false,
-  "features.tool_call_mcp_elicitation": true,
-};
+class UsageError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UsageError";
+  }
+}
 
-const SENSITIVE_KEY =
-  /authorization|bearer|token|access[_-]?token|refresh[_-]?token|id[_-]?token|api[_-]?key|apikey|secret|cookie|chatgpt[_-]?account[_-]?id|session[_-]?id/i;
-
-class CliError extends Error {}
-
-function usage(exitCode = 0) {
-  const text = `
-Usage:
-  node codex-imagen.mjs "make a small watercolor robot"
-  node codex-imagen.mjs --prompt "make a small watercolor robot"
-  node codex-imagen.mjs --debug "make a small watercolor robot"
+function usage() {
+  return `Usage:
+  codex-imagen "prompt" [options]
+  node scripts/codex-imagen.mjs "prompt" [options]
 
 Options:
-  --prompt <text>                Prompt for the image generation turn.
-  --prompt-file <path>           Read the prompt from a UTF-8 text file.
-  --codex-bin <path|name>        Codex binary. Overrides CODEX_IMAGEN_CODEX_BIN, CODEX_APP_SERVER_BIN, and CODEX_BIN.
-  --imagegen-skill-path <path>   Optional explicit imagegen SKILL.md path.
-  --cwd <path>                   Working directory for the Codex thread. Defaults to current directory.
-  --out-dir <path>               Where decoded images are written.
-  --json                         Print the full machine-readable summary to stdout.
-  --debug                        Write <out-dir>/codex-imagen.jsonl and diagnostics to stderr.
-  --log <path>                   Write a redacted JSON-RPC log to this path.
-  --model <id>                   Collaboration-mode model. Defaults to ${DEFAULT_MODEL}.
-  --effort <effort>              Reasoning effort. Defaults to ${DEFAULT_EFFORT}.
-  --timeout-ms <ms>              Turn timeout. Defaults to ${DEFAULT_TIMEOUT_MS}.
-  --smoke                        Initialize app-server and inspect models/skills; do not generate.
-  --version                      Print version.
-  --help                         Show this help.
+  --prompt <text>       Prompt text. Positional text is also accepted.
+  --prompt-file <path>  Read prompt from a UTF-8 file.
+  -i, --image <path>    Attach local reference image(s). Repeat or comma-separate.
+  --input-ref <path|url>
+                        Attach a reference image from a local path, http(s) URL, or data:image URL.
+                        Repeat or comma-separate.
+  --image-url <url>     Attach an image URL or data:image/... URL as a reference.
+  --image-detail <mode> input_image detail: high, low, auto, original. Default: ${DEFAULT_IMAGE_DETAIL}
+  -o, --output <path>   Output PNG path.
+                        If multiple images arrive, saves name-1.png, name-2.png, ...
+                        If this has no extension or ends in /, treats it as a directory.
+  --out-dir <path>      Output directory when --output is not provided.
+  --model <name>        Model slug. Default: ${DEFAULT_MODEL}
+  --auth <path>         Auth JSON path. Supports Codex auth.json, OpenClaw auth-profiles.json,
+                        OpenClaw legacy auth.json, and OpenClaw credentials/oauth.json.
+  --auth-profile <id>   OpenClaw auth profile id. Default: auth-state lastGood, then best openai-codex OAuth profile.
+  --base-url <url>      Codex backend base URL. Default: ${DEFAULT_BASE_URL}
+  --refresh-url <url>   OAuth refresh endpoint. Default: ${DEFAULT_REFRESH_URL}
+  --cwd <path>          Resolve relative input/output paths from this working directory.
+  --smoke               Check auth discovery and print redacted auth metadata. No generation.
+  --force-refresh       Refresh Codex OAuth before generating.
+  --refresh-only        Refresh Codex OAuth and exit. Does not require a prompt.
+  --no-refresh          Disable proactive refresh and 401 refresh retry.
+  --timeout-ms <ms>     Abort after this many ms. Default: ${DEFAULT_TIMEOUT_MS}. Use 0 to disable.
+  --no-stream           Request a non-streaming response.
+  --json                Print a JSON summary instead of only the image path.
+  --quiet               Do not print progress diagnostics to stderr.
+  --verbose             Print request progress and raw event names to stderr.
+  --debug               Alias for --verbose.
+  --version             Print version.
+  -h, --help            Show this help.
 
-Environment:
-  CODEX_IMAGEN_CODEX_BIN         Preferred Codex binary path/name.
-  CODEX_IMAGEN_OUT_DIR           Preferred output directory.
-  CODEX_IMAGEN_LOG               Preferred JSON-RPC log path. Enables debug logging.
-  CODEX_IMAGEN_SKILL_PATH        Preferred imagegen SKILL.md path.
-  OPENCLAW_OUTPUT_DIR            OpenClaw-provided artifact directory, if set.
-  OPENCLAW_AGENT_DIR             Used as <agent>/artifacts/codex-imagen when no output dir is set.
-  OPENCLAW_STATE_DIR             Used as <state>/artifacts/codex-imagen when no agent dir is set.
-  CODEX_HOME                     Used to find skills/.system/imagegen/SKILL.md.
-`.trim();
-  console.log(text);
-  process.exit(exitCode);
+Auth discovery order:
+  1. --auth
+  2. CODEX_IMAGEN_AUTH_JSON, OPENCLAW_CODEX_AUTH_JSON, CODEX_AUTH_JSON
+  3. OPENCLAW_AGENT_DIR/auth-profiles.json or PI_CODING_AGENT_DIR/auth-profiles.json
+  4. ~/.openclaw/agents/main/agent/auth-profiles.json
+  5. ~/.openclaw/credentials/oauth.json
+  6. CODEX_HOME/auth.json
+  7. ~/.codex/auth.json
+`;
 }
 
-function expandEqualsArgs(argv) {
-  const out = [];
-  for (const arg of argv) {
-    if (arg.startsWith("--") && arg.includes("=")) {
-      const [flag, ...parts] = arg.split("=");
-      out.push(flag, parts.join("="));
-    } else {
-      out.push(arg);
-    }
-  }
-  return out;
-}
-
-function parseArgs(rawArgv) {
-  const argv = expandEqualsArgs(rawArgv);
-  const opts = {
+function parseArgs(argv) {
+  const options = {
+    authPath: null,
+    authProfile: process.env.CODEX_IMAGEN_AUTH_PROFILE || process.env.OPENCLAW_AUTH_PROFILE || null,
+    baseUrl: DEFAULT_BASE_URL,
+    cwd: null,
+    forceRefresh: false,
+    imageDetail: DEFAULT_IMAGE_DETAIL,
+    imagePaths: [],
+    imageUrls: [],
+    json: false,
+    model: DEFAULT_MODEL,
+    outDir: null,
+    output: null,
     prompt: null,
     promptFile: null,
-    codexBinInput: null,
-    imagegenSkillPathInput: null,
-    cwd: process.cwd(),
-    outDirInput: null,
-    logPathInput: null,
-    model: DEFAULT_MODEL,
-    effort: DEFAULT_EFFORT,
-    timeoutMs: DEFAULT_TIMEOUT_MS,
-    json: false,
-    debug: false,
+    quiet: false,
+    refresh: true,
+    refreshOnly: false,
+    refreshSkewSeconds: DEFAULT_REFRESH_SKEW_SECONDS,
+    refreshUrl: process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE || DEFAULT_REFRESH_URL,
     smoke: false,
+    stream: true,
+    timeoutMs: DEFAULT_TIMEOUT_MS,
+    verbose: false,
   };
-  const rest = [];
-  const valueFlags = new Set([
-    "--prompt",
-    "--prompt-file",
-    "--codex-bin",
-    "--imagegen-skill-path",
-    "--cwd",
-    "--out-dir",
-    "--log",
-    "--model",
-    "--effort",
-    "--timeout-ms",
-  ]);
+
+  const positionals = [];
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--help" || arg === "-h") usage(0);
-    if (arg === "--version") {
-      console.log(VERSION);
-      process.exit(0);
-    }
-    if (arg === "--smoke") {
-      opts.smoke = true;
-      continue;
-    }
-    if (arg === "--debug") {
-      opts.debug = true;
-      continue;
-    }
-    if (arg === "--json") {
-      opts.json = true;
-      continue;
-    }
-    if (arg === "--") {
-      rest.push(...argv.slice(i + 1));
-      break;
-    }
-    if (valueFlags.has(arg)) {
-      if (i + 1 >= argv.length) throw new CliError(`Missing value for ${arg}`);
-      const value = argv[i + 1];
+    const next = () => {
       i += 1;
-      if (arg === "--prompt") opts.prompt = value;
-      else if (arg === "--prompt-file") opts.promptFile = value;
-      else if (arg === "--codex-bin") opts.codexBinInput = value;
-      else if (arg === "--imagegen-skill-path") opts.imagegenSkillPathInput = value;
-      else if (arg === "--cwd") opts.cwd = resolveUserPath(value);
-      else if (arg === "--out-dir") opts.outDirInput = value;
-      else if (arg === "--log") opts.logPathInput = value;
-      else if (arg === "--model") opts.model = value;
-      else if (arg === "--effort") opts.effort = value;
-      else if (arg === "--timeout-ms") opts.timeoutMs = Number.parseInt(value, 10);
-      continue;
-    }
-    if (arg.startsWith("--")) throw new CliError(`Unknown option: ${arg}`);
-    rest.push(arg);
-  }
-
-  if (opts.promptFile && opts.prompt) {
-    throw new CliError("Use either --prompt or --prompt-file, not both");
-  }
-  if (opts.promptFile) {
-    opts.prompt = fs.readFileSync(resolveUserPath(opts.promptFile), "utf8").trim();
-  } else if (!opts.prompt && rest.length > 0) {
-    opts.prompt = rest.join(" ");
-  }
-  if (!opts.smoke && !opts.prompt) usage(2);
-  if (!Number.isFinite(opts.timeoutMs) || opts.timeoutMs <= 0) {
-    throw new CliError("--timeout-ms must be a positive integer");
-  }
-  return finalizeOptions(opts);
-}
-
-function resolveUserPath(value, baseDir = process.cwd()) {
-  if (!value) return value;
-  let expanded = String(value);
-  const home = os.homedir();
-  if (expanded === "~") {
-    expanded = home;
-  } else if (expanded.startsWith("~/") || expanded.startsWith("~\\")) {
-    expanded = path.join(home, expanded.slice(2));
-  }
-  return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(baseDir, expanded);
-}
-
-function isPathLike(value) {
-  return (
-    path.isAbsolute(value) ||
-    value.startsWith(".") ||
-    value.startsWith("~") ||
-    value.includes("/") ||
-    value.includes("\\")
-  );
-}
-
-function isFile(filePath) {
-  try {
-    return fs.statSync(filePath).isFile();
-  } catch {
-    return false;
-  }
-}
-
-function isExecutable(filePath) {
-  if (!isFile(filePath)) return false;
-  if (process.platform === "win32") return true;
-  try {
-    fs.accessSync(filePath, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function getPathEnv(env = process.env) {
-  if (env.PATH) return env.PATH;
-  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path");
-  return pathKey ? env[pathKey] : "";
-}
-
-function splitPathEnv(pathEnv) {
-  return String(pathEnv || "")
-    .split(path.delimiter)
-    .map((entry) => entry.replace(/^"|"$/g, ""))
-    .filter(Boolean);
-}
-
-function executableNames(command) {
-  if (process.platform !== "win32" || path.extname(command)) return [command];
-  const extNames = (process.env.PATHEXT || ".COM;.EXE;.BAT;.CMD")
-    .split(";")
-    .filter(Boolean)
-    .flatMap((ext) => [ext.toLowerCase(), ext.toUpperCase()]);
-  return [command, ...extNames.map((ext) => `${command}${ext}`)];
-}
-
-function findExecutableInDirs(command, dirs) {
-  const names = executableNames(command);
-  for (const entry of dirs) {
-    for (const name of names) {
-      const candidate = path.join(entry, name);
-      if (isExecutable(candidate)) return candidate;
-    }
-  }
-  return null;
-}
-
-function findExecutableOnPath(command) {
-  const pathEntries = splitPathEnv(getPathEnv());
-  return findExecutableInDirs(command, pathEntries);
-}
-
-function cmdQuote(value) {
-  const text = String(value);
-  if (text.includes('"')) {
-    throw new CliError(`Windows command path/argument contains an unsupported quote character: ${text}`);
-  }
-  return `"${text}"`;
-}
-
-function buildSpawnCommand(command, args) {
-  if (process.platform === "win32" && /\.(cmd|bat)$/i.test(command)) {
-    const commandLine = [command, ...args].map(cmdQuote).join(" ");
-    return {
-      command: process.env.ComSpec || "cmd.exe",
-      args: ["/d", "/s", "/c", commandLine],
-    };
-  }
-  return { command, args };
-}
-
-function spawnSyncPortable(command, args, options = {}) {
-  const built = buildSpawnCommand(command, args);
-  return spawnSync(built.command, built.args, {
-    ...options,
-    windowsHide: true,
-  });
-}
-
-function npmGlobalPrefix() {
-  const npmBin = findExecutableOnPath("npm");
-  if (!npmBin) return null;
-  const result = spawnSyncPortable(npmBin, ["config", "get", "prefix"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"],
-  });
-  if (result.status !== 0) return null;
-  const prefix = String(result.stdout || "").trim();
-  if (!prefix || prefix === "undefined" || prefix === "null") return null;
-  return prefix;
-}
-
-function platformCodexReleaseNames() {
-  if (process.platform === "darwin") {
-    return process.arch === "arm64"
-      ? ["codex-aarch64-apple-darwin", "codex"]
-      : ["codex-x86_64-apple-darwin", "codex"];
-  }
-  if (process.platform === "linux") {
-    return process.arch === "arm64"
-      ? ["codex-aarch64-unknown-linux-musl", "codex"]
-      : ["codex-x86_64-unknown-linux-musl", "codex"];
-  }
-  if (process.platform === "win32") {
-    return process.arch === "arm64"
-      ? ["codex-aarch64-pc-windows-msvc.exe", "codex"]
-      : ["codex-x86_64-pc-windows-msvc.exe", "codex"];
-  }
-  return ["codex"];
-}
-
-function uniqueStrings(values) {
-  return [...new Set(values.filter(Boolean))];
-}
-
-function codexCandidateDirs() {
-  const dirs = [];
-  const npmPrefix = npmGlobalPrefix();
-  if (npmPrefix) {
-    dirs.push(process.platform === "win32" ? npmPrefix : path.join(npmPrefix, "bin"));
-  }
-
-  dirs.push(...splitPathEnv(getPathEnv()));
-
-  const nodeDir = path.dirname(process.execPath);
-  dirs.push(nodeDir);
-
-  const home = os.homedir();
-  if (process.platform === "win32") {
-    const appData = process.env.APPDATA || (home ? path.join(home, "AppData", "Roaming") : null);
-    const localAppData = process.env.LOCALAPPDATA || (home ? path.join(home, "AppData", "Local") : null);
-    dirs.push(
-      appData ? path.join(appData, "npm") : null,
-      localAppData ? path.join(localAppData, "Microsoft", "WindowsApps") : null,
-      process.env.ProgramFiles ? path.join(process.env.ProgramFiles, "nodejs") : null,
-      process.env["ProgramFiles(x86)"] ? path.join(process.env["ProgramFiles(x86)"], "nodejs") : null,
-    );
-  } else {
-    dirs.push(
-      path.join(home, ".local", "bin"),
-      path.join(home, ".npm-global", "bin"),
-      path.join(home, "bin"),
-      "/opt/homebrew/bin",
-      "/usr/local/bin",
-      "/usr/bin",
-      "/bin",
-      "/snap/bin",
-    );
-  }
-
-  return uniqueStrings(dirs.map((dir) => (dir ? resolveUserPath(dir) : null)));
-}
-
-function findCodexBinaryInKnownLocations() {
-  const dirs = codexCandidateDirs();
-  for (const name of platformCodexReleaseNames()) {
-    const found = findExecutableInDirs(name, dirs);
-    if (found) return { path: found, source: name === "codex" ? "auto-detected PATH/npm/common dirs" : `auto-detected release binary ${name}` };
-  }
-  return null;
-}
-
-function formatCodexSearchHint() {
-  const dirs = codexCandidateDirs().slice(0, 20);
-  return dirs.length > 0 ? ` Checked: ${dirs.join(", ")}` : "";
-}
-
-function buildChildEnv(extra = {}) {
-  const env = { ...process.env, ...extra };
-  if (process.platform === "win32") {
-    const pathValue = getPathEnv(env);
-    for (const key of Object.keys(env)) {
-      if (key.toLowerCase() === "path") delete env[key];
-    }
-    if (pathValue) env.PATH = pathValue;
-  }
-  return env;
-}
-
-function resolveExecutable(input) {
-  if (!input) return null;
-  if (isPathLike(input)) {
-    const resolved = resolveUserPath(input);
-    return isExecutable(resolved) ? resolved : null;
-  }
-  return findExecutableOnPath(input);
-}
-
-function resolveCodexBin(input) {
-  const configured = [
-    ["--codex-bin", input],
-    ["CODEX_IMAGEN_CODEX_BIN", process.env.CODEX_IMAGEN_CODEX_BIN],
-    ["CODEX_APP_SERVER_BIN", process.env.CODEX_APP_SERVER_BIN],
-    ["CODEX_BIN", process.env.CODEX_BIN],
-  ].filter(([, value]) => value);
-
-  for (const [source, value] of configured) {
-    const resolved = resolveExecutable(value);
-    if (!resolved) {
-      throw new CliError(
-        `Codex binary from ${source} was not found: ${value}. Install Codex CLI, open Codex Desktop, or pass --codex-bin.${formatCodexSearchHint()}`,
-      );
-    }
-    return { path: resolved, source };
-  }
-
-  if (process.platform === "darwin" && isExecutable(MACOS_CODEX_APP_BIN)) {
-    return { path: MACOS_CODEX_APP_BIN, source: "macOS Codex.app" };
-  }
-
-  const fromPath = resolveExecutable("codex");
-  if (fromPath) return { path: fromPath, source: "PATH" };
-
-  const detected = findCodexBinaryInKnownLocations();
-  if (detected) return detected;
-
-  throw new CliError(
-    `Could not find a Codex binary. Install Codex CLI, open Codex Desktop, or pass --codex-bin / set CODEX_IMAGEN_CODEX_BIN.${formatCodexSearchHint()}`,
-  );
-}
-
-function resolveOutputDir(input) {
-  const candidates = [
-    ["--out-dir", input],
-    ["CODEX_IMAGEN_OUT_DIR", process.env.CODEX_IMAGEN_OUT_DIR],
-    ["OPENCLAW_OUTPUT_DIR", process.env.OPENCLAW_OUTPUT_DIR],
-  ].filter(([, value]) => value);
-  if (candidates.length > 0) {
-    const [source, value] = candidates[0];
-    return { path: resolveUserPath(value), source };
-  }
-  if (process.env.OPENCLAW_AGENT_DIR) {
-    return {
-      path: path.join(resolveUserPath(process.env.OPENCLAW_AGENT_DIR), "artifacts", "codex-imagen"),
-      source: "OPENCLAW_AGENT_DIR",
-    };
-  }
-  if (process.env.OPENCLAW_STATE_DIR) {
-    return {
-      path: path.join(resolveUserPath(process.env.OPENCLAW_STATE_DIR), "artifacts", "codex-imagen"),
-      source: "OPENCLAW_STATE_DIR",
-    };
-  }
-  return { path: path.resolve(process.cwd(), "codex-imagen-output"), source: "cwd" };
-}
-
-function resolveLogPath(input, outDir, debug) {
-  const candidates = [
-    ["--log", input],
-    ["CODEX_IMAGEN_LOG", process.env.CODEX_IMAGEN_LOG],
-  ].filter(([, value]) => value);
-  if (candidates.length > 0) {
-    const [source, value] = candidates[0];
-    return { path: resolveUserPath(value), source, enabled: true };
-  }
-  if (debug) {
-    return { path: path.join(outDir, "codex-imagen.jsonl"), source: "--debug", enabled: true };
-  }
-  return { path: null, source: null, enabled: false };
-}
-
-function resolveImagegenSkillPath(input) {
-  const checked = [];
-  const explicit = [
-    ["--imagegen-skill-path", input],
-    ["CODEX_IMAGEN_SKILL_PATH", process.env.CODEX_IMAGEN_SKILL_PATH],
-  ].filter(([, value]) => value);
-
-  for (const [source, value] of explicit) {
-    const candidate = resolveUserPath(value);
-    const exists = isFile(candidate);
-    checked.push({ source, path: candidate, exists });
-    if (exists) return { path: candidate, source, checked };
-    return { path: null, source: null, checked };
-  }
-
-  const codexHome = process.env.CODEX_HOME ? resolveUserPath(process.env.CODEX_HOME) : path.join(os.homedir(), ".codex");
-  const candidates = [
-    ["CODEX_HOME/default", path.join(codexHome, "skills", ".system", "imagegen", "SKILL.md")],
-    ["home/default", path.join(os.homedir(), ".codex", "skills", ".system", "imagegen", "SKILL.md")],
-  ];
-  const seen = new Set();
-  for (const [source, candidate] of candidates) {
-    if (seen.has(candidate)) continue;
-    seen.add(candidate);
-    const exists = isFile(candidate);
-    checked.push({ source, path: candidate, exists });
-    if (exists) return { path: candidate, source, checked };
-  }
-  return { path: null, source: null, checked };
-}
-
-function finalizeOptions(raw) {
-  const codexBin = resolveCodexBin(raw.codexBinInput);
-  const outDir = resolveOutputDir(raw.outDirInput);
-  const logPath = resolveLogPath(raw.logPathInput, outDir.path, raw.debug);
-  const imagegenSkillPath = resolveImagegenSkillPath(raw.imagegenSkillPathInput);
-  const warnings = [];
-
-  if (!imagegenSkillPath.path) {
-    warnings.push(
-      "No local imagegen SKILL.md was found. The script will still send a $imagegen prompt, but generation may fail if this Codex install cannot resolve the built-in skill automatically.",
-    );
-  }
-
-  return {
-    ...raw,
-    codexBin: codexBin.path,
-    codexBinSource: codexBin.source,
-    outDir: outDir.path,
-    outDirSource: outDir.source,
-    logPath: logPath.path,
-    logPathSource: logPath.source,
-    debug: raw.debug || logPath.enabled,
-    json: raw.json,
-    imagegenSkillPath: imagegenSkillPath.path,
-    imagegenSkillPathSource: imagegenSkillPath.source,
-    imagegenSkillPathChecked: imagegenSkillPath.checked,
-    warnings,
-  };
-}
-
-function looksLikeImagePayload(value) {
-  if (typeof value !== "string") return false;
-  if (value.startsWith("data:image/")) return true;
-  if (value.startsWith("iVBORw0KGgo")) return true;
-  if (value.startsWith("/9j/")) return true;
-  if (value.length < 4096) return false;
-  return /^[A-Za-z0-9+/_=-]+$/.test(value.slice(0, 2048));
-}
-
-function scrub(value, key = "") {
-  if (SENSITIVE_KEY.test(key)) return "[REDACTED]";
-  if (typeof value === "string") {
-    if (looksLikeImagePayload(value)) {
-      return { __redacted: "image_or_large_base64_string", length: value.length };
-    }
-    if (value.length > 1200) {
-      return {
-        __truncated_string: true,
-        length: value.length,
-        prefix: value.slice(0, 240),
-      };
-    }
-    return value;
-  }
-  if (Array.isArray(value)) return value.map((item) => scrub(item, key));
-  if (value && typeof value === "object") {
-    const out = {};
-    for (const [childKey, childValue] of Object.entries(value)) {
-      out[childKey] = scrub(childValue, childKey);
-    }
-    return out;
-  }
-  return value;
-}
-
-function decodeImagePayload(payload) {
-  if (!payload || typeof payload !== "string") return null;
-  let base64 = payload;
-  let ext = "png";
-  let mimeType = "image/png";
-  const match = payload.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/s);
-  if (match) {
-    mimeType = match[1];
-    base64 = match[2];
-    ext = mimeType.split("/")[1] || ext;
-  }
-  base64 = base64.replace(/-/g, "+").replace(/_/g, "/").replace(/\s+/g, "");
-  const bytes = Buffer.from(base64, "base64");
-  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
-    return { bytes, ext: "png", mimeType: "image/png" };
-  }
-  if (bytes[0] === 0xff && bytes[1] === 0xd8) {
-    return { bytes, ext: "jpg", mimeType: "image/jpeg" };
-  }
-  if (bytes.length > 0) return { bytes, ext, mimeType };
-  return null;
-}
-
-function safeFileStem(value) {
-  return String(value || `image-${Date.now()}`).replace(/[^a-zA-Z0-9._-]+/g, "_").slice(0, 160);
-}
-
-function uniqueImagePath(outDir, stem, ext) {
-  let candidate = path.join(outDir, `${stem}.${ext}`);
-  let index = 2;
-  while (fs.existsSync(candidate)) {
-    candidate = path.join(outDir, `${stem}-${index}.${ext}`);
-    index += 1;
-  }
-  return candidate;
-}
-
-function debugLog(opts, message) {
-  if (opts.debug) console.error(`[codex-imagen] ${message}`);
-}
-
-class CodexAppServerClient {
-  constructor(opts) {
-    this.opts = opts;
-    this.nextId = 1;
-    this.pending = new Map();
-    this.stderr = "";
-    this.notifications = [];
-    this.notificationHandler = null;
-    this.closed = false;
-    this.logStream = null;
-    if (opts.logPath) {
-      fs.mkdirSync(path.dirname(opts.logPath), { recursive: true });
-      this.logStream = fs.createWriteStream(opts.logPath, { flags: "a", mode: 0o600 });
-    }
-  }
-
-  start() {
-    const spawnOptions = {
-      cwd: this.opts.cwd,
-      env: buildChildEnv({ CODEX_CLI_PATH: this.opts.codexBin }),
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    };
-    const built = buildSpawnCommand(this.opts.codexBin, ["app-server", "--listen", "stdio://"]);
-    this.proc = spawn(built.command, built.args, spawnOptions);
-    this.writeLog({
-      event: "spawn",
-      pid: process.pid,
-      childPid: this.proc.pid,
-      codexBin: this.opts.codexBin,
-      codexBinSource: this.opts.codexBinSource,
-      cwd: this.opts.cwd,
-    });
-    this.proc.stderr.setEncoding("utf8");
-    this.proc.stderr.on("data", (chunk) => {
-      this.stderr += chunk;
-      this.writeLog({ direction: "appserver_stderr", text: chunk });
-    });
-    this.proc.on("exit", (code, signal) => {
-      this.closed = true;
-      const error = code === 0 ? null : new Error(`app-server exited: code=${code} signal=${signal || ""}`);
-      for (const { reject } of this.pending.values()) {
-        reject(error || new Error("app-server exited"));
+      if (i >= argv.length) {
+        throw new UsageError(`Missing value for ${arg}`);
       }
-      this.pending.clear();
-    });
-    this.proc.on("error", (error) => {
-      this.closed = true;
-      for (const { reject } of this.pending.values()) reject(error);
-      this.pending.clear();
-    });
-    this.rl = readline.createInterface({ input: this.proc.stdout });
-    this.rl.on("line", (line) => this.handleLine(line));
-  }
+      return argv[i];
+    };
+    const longValue = (name) => {
+      const prefix = `${name}=`;
+      return arg.startsWith(prefix) ? arg.slice(prefix.length) : null;
+    };
 
-  writeLog(record) {
-    if (!this.logStream) return;
-    this.logStream.write(`${JSON.stringify({ ts: new Date().toISOString(), ...scrub(record) })}\n`);
-  }
-
-  send(message) {
-    if (this.closed) throw new Error("app-server client is closed");
-    const line = JSON.stringify(message);
-    this.writeLog({ direction: "client_to_appserver", frame: message });
-    this.proc.stdin.write(`${line}\n`);
-  }
-
-  request(method, params) {
-    const id = this.nextId;
-    this.nextId += 1;
-    const promise = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
-    });
-    this.send({ id, method, params });
-    return promise;
-  }
-
-  notify(method, params = {}) {
-    this.send({ method, params });
-  }
-
-  handleLine(line) {
-    if (!line.trim()) return;
-    let msg;
-    try {
-      msg = JSON.parse(line);
-    } catch (error) {
-      this.writeLog({ direction: "appserver_to_client", parseError: String(error?.message || error), line });
-      return;
-    }
-    this.writeLog({ direction: "appserver_to_client", frame: msg });
-    if (msg.id !== undefined && msg.method) {
-      this.handleServerRequest(msg);
-      return;
-    }
-    if (msg.id !== undefined) {
-      const pending = this.pending.get(msg.id);
-      if (!pending) return;
-      this.pending.delete(msg.id);
-      if (msg.error) pending.reject(Object.assign(new Error(msg.error.message || pending.method), { data: msg.error }));
-      else pending.resolve(msg.result ?? {});
-      return;
-    }
-    if (msg.method) {
-      this.notifications.push(msg);
-      this.notificationHandler?.(msg);
-    }
-  }
-
-  handleServerRequest(msg) {
-    let result;
-    if (msg.method === "item/commandExecution/requestApproval") {
-      result = { decision: "decline" };
-    } else if (msg.method === "item/fileChange/requestApproval") {
-      result = { decision: "decline" };
-    } else if (msg.method === "item/tool/requestUserInput") {
-      result = { answers: {} };
-    } else if (msg.method === "mcpServer/elicitation/request") {
-      result = { action: "decline", content: null, _meta: null };
-    } else if (msg.method === "item/tool/call") {
-      result = {
-        success: false,
-        contentItems: [{ type: "inputText", text: `Dynamic tool ${msg.params?.tool || ""} is not implemented by codex-imagen.` }],
-      };
+    if (arg === "-h" || arg === "--help") {
+      options.help = true;
+    } else if (arg === "--version") {
+      options.version = true;
+    } else if (longValue("--prompt") !== null) {
+      options.prompt = longValue("--prompt");
+    } else if (arg === "--prompt") {
+      options.prompt = next();
+    } else if (longValue("--prompt-file") !== null) {
+      options.promptFile = longValue("--prompt-file");
+    } else if (arg === "--prompt-file") {
+      options.promptFile = next();
+    } else if (longValue("--image") !== null) {
+      options.imagePaths.push(...splitCommaValues(longValue("--image")));
+    } else if (arg === "-i" || arg === "--image") {
+      options.imagePaths.push(...splitCommaValues(next()));
+    } else if (longValue("--input-ref") !== null) {
+      addInputRefs(options, longValue("--input-ref"));
+    } else if (arg === "--input-ref") {
+      addInputRefs(options, next());
+    } else if (longValue("--image-url") !== null) {
+      options.imageUrls.push(longValue("--image-url"));
+    } else if (arg === "--image-url") {
+      options.imageUrls.push(next());
+    } else if (longValue("--image-detail") !== null) {
+      const value = longValue("--image-detail");
+      if (!["auto", "low", "high", "original"].includes(value)) {
+        throw new UsageError("--image-detail must be one of: auto, low, high, original");
+      }
+      options.imageDetail = value;
+    } else if (arg === "--image-detail") {
+      const value = next();
+      if (!["auto", "low", "high", "original"].includes(value)) {
+        throw new UsageError("--image-detail must be one of: auto, low, high, original");
+      }
+      options.imageDetail = value;
+    } else if (longValue("--output") !== null) {
+      options.output = longValue("--output");
+    } else if (arg === "-o" || arg === "--output") {
+      options.output = next();
+    } else if (longValue("--out-dir") !== null) {
+      options.outDir = longValue("--out-dir");
+    } else if (arg === "--out-dir") {
+      options.outDir = next();
+    } else if (longValue("--model") !== null) {
+      options.model = longValue("--model");
+    } else if (arg === "--model") {
+      options.model = next();
+    } else if (longValue("--auth") !== null) {
+      options.authPath = longValue("--auth");
+    } else if (arg === "--auth") {
+      options.authPath = next();
+    } else if (longValue("--auth-profile") !== null) {
+      options.authProfile = longValue("--auth-profile");
+    } else if (arg === "--auth-profile") {
+      options.authProfile = next();
+    } else if (longValue("--base-url") !== null) {
+      options.baseUrl = longValue("--base-url");
+    } else if (arg === "--base-url") {
+      options.baseUrl = next();
+    } else if (longValue("--refresh-url") !== null) {
+      options.refreshUrl = longValue("--refresh-url");
+    } else if (arg === "--refresh-url") {
+      options.refreshUrl = next();
+    } else if (longValue("--cwd") !== null) {
+      options.cwd = longValue("--cwd");
+    } else if (arg === "--cwd") {
+      options.cwd = next();
+    } else if (arg === "--smoke") {
+      options.smoke = true;
+    } else if (arg === "--force-refresh") {
+      options.forceRefresh = true;
+    } else if (arg === "--refresh-only") {
+      options.refreshOnly = true;
+    } else if (arg === "--no-refresh") {
+      options.refresh = false;
+    } else if (longValue("--timeout-ms") !== null) {
+      const value = Number(longValue("--timeout-ms"));
+      if (!Number.isFinite(value) || value < 0) {
+        throw new UsageError("--timeout-ms must be a non-negative number");
+      }
+      options.timeoutMs = value;
+    } else if (arg === "--timeout-ms") {
+      const value = Number(next());
+      if (!Number.isFinite(value) || value < 0) {
+        throw new UsageError("--timeout-ms must be a non-negative number");
+      }
+      options.timeoutMs = value;
+    } else if (arg === "--no-stream") {
+      options.stream = false;
+    } else if (arg === "--json") {
+      options.json = true;
+    } else if (arg === "--quiet") {
+      options.quiet = true;
+    } else if (arg === "--verbose") {
+      options.verbose = true;
+    } else if (arg === "--debug") {
+      options.verbose = true;
+    } else if (arg.startsWith("-")) {
+      throw new UsageError(`Unknown option: ${arg}`);
     } else {
-      this.send({
-        id: msg.id,
-        error: { code: -32601, message: `Unsupported server request: ${msg.method}` },
-      });
-      return;
+      positionals.push(arg);
     }
-    this.send({ id: msg.id, result });
   }
 
-  async close() {
-    if (this.closed) return;
-    this.closed = true;
-    this.rl?.close();
-    this.proc?.stdin?.end();
-    if (this.proc && !this.proc.killed) this.proc.kill("SIGTERM");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    this.logStream?.end();
+  if ((options.prompt || options.promptFile) && positionals.length > 0) {
+    throw new UsageError(
+      `Unexpected positional argument with --prompt: ${positionals[0]}. Use -i/--image or --input-ref for reference images.`
+    );
+  } else if (!options.prompt && positionals.length > 0) {
+    options.prompt = positionals.join(" ");
   }
+
+  return options;
 }
 
-function buildInput(prompt, opts) {
-  const input = [{ type: "text", text: `$imagegen ${prompt}`, text_elements: [] }];
-  if (opts.imagegenSkillPath) {
-    input.push({ type: "skill", name: "imagegen", path: opts.imagegenSkillPath });
+function resolveUserPath(input) {
+  if (!input) {
+    return input;
   }
+
+  if (input === "~") {
+    return os.homedir();
+  }
+
+  const slash = input.startsWith("~/") || input.startsWith("~\\");
+  if (slash) {
+    return path.join(os.homedir(), input.slice(2));
+  }
+
   return input;
 }
 
-function saveImageItem(item, outDir) {
-  const payload = item.result;
-  const decoded = decodeImagePayload(payload);
-  if (!decoded) {
-    return {
-      id: item.id,
-      status: item.status,
-      revisedPrompt: item.revisedPrompt ?? item.revised_prompt ?? null,
-      savedPath: item.savedPath ?? item.saved_path ?? null,
-      decodedPath: null,
-      error: "no decodable base64 result",
-    };
+function existingFileSync(pathname) {
+  try {
+    return !!pathname && fsSync.statSync(pathname).isFile();
+  } catch {
+    return false;
   }
-  fs.mkdirSync(outDir, { recursive: true });
-  const stem = safeFileStem(item.id);
-  const decodedPath = uniqueImagePath(outDir, stem, decoded.ext);
-  fs.writeFileSync(decodedPath, decoded.bytes, { mode: 0o600 });
+}
+
+function existingDirSync(pathname) {
+  try {
+    return !!pathname && fsSync.statSync(pathname).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function uniq(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function resolvePathFromCwd(input) {
+  return path.resolve(resolveUserPath(input));
+}
+
+function resolveOpenClawStateDir() {
+  const override = process.env.OPENCLAW_STATE_DIR?.trim();
+  if (override) {
+    return resolvePathFromCwd(override);
+  }
+
+  const current = path.join(os.homedir(), ".openclaw");
+  if (existingDirSync(current)) {
+    return current;
+  }
+
+  const legacy = path.join(os.homedir(), ".clawdbot");
+  if (existingDirSync(legacy)) {
+    return legacy;
+  }
+
+  return current;
+}
+
+function resolveOpenClawAgentDir() {
+  const override = process.env.OPENCLAW_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
+  if (override) {
+    return resolvePathFromCwd(override);
+  }
+  return path.join(resolveOpenClawStateDir(), "agents", DEFAULT_OPENCLAW_AGENT_ID, "agent");
+}
+
+function resolveOpenClawOAuthDir() {
+  const override = process.env.OPENCLAW_OAUTH_DIR?.trim();
+  if (override) {
+    return resolvePathFromCwd(override);
+  }
+  return path.join(resolveOpenClawStateDir(), "credentials");
+}
+
+function authPathCandidates() {
+  const envCandidates = [
+    process.env.CODEX_IMAGEN_AUTH_JSON,
+    process.env.OPENCLAW_CODEX_AUTH_JSON,
+    process.env.CODEX_AUTH_JSON,
+  ].map((value) => (value?.trim() ? resolvePathFromCwd(value.trim()) : null));
+
+  const codexHome = process.env.CODEX_HOME?.trim()
+    ? path.join(resolvePathFromCwd(process.env.CODEX_HOME.trim()), "auth.json")
+    : null;
+
+  return uniq([
+    ...envCandidates,
+    path.join(resolveOpenClawAgentDir(), "auth-profiles.json"),
+    path.join(resolveOpenClawAgentDir(), "auth.json"),
+    path.join(resolveOpenClawOAuthDir(), "oauth.json"),
+    codexHome,
+    DEFAULT_CODEX_AUTH_PATH,
+  ]);
+}
+
+function resolveAuthPath(options) {
+  if (options.authPath) {
+    return resolvePathFromCwd(options.authPath);
+  }
+
+  const candidates = authPathCandidates();
+  const found = candidates.find(existingFileSync);
+  if (found) {
+    return found;
+  }
+
+  throw new Error(
+    `No auth JSON found. Tried:\n${candidates.map((candidate) => `  - ${candidate}`).join("\n")}`
+  );
+}
+
+function defaultOutputDir() {
+  const explicit =
+    process.env.CODEX_IMAGEN_OUT_DIR?.trim() || process.env.OPENCLAW_OUTPUT_DIR?.trim();
+  if (explicit) {
+    return resolvePathFromCwd(explicit);
+  }
+
+  const agentDir = process.env.OPENCLAW_AGENT_DIR?.trim() || process.env.PI_CODING_AGENT_DIR?.trim();
+  if (agentDir) {
+    return path.join(resolvePathFromCwd(agentDir), "artifacts", "codex-imagen");
+  }
+
+  const stateDir = process.env.OPENCLAW_STATE_DIR?.trim();
+  if (stateDir) {
+    return path.join(resolvePathFromCwd(stateDir), "artifacts", "codex-imagen");
+  }
+
+  return path.resolve(process.cwd(), "codex-imagen-output");
+}
+
+function normalizeOptions(options) {
+  if (options.cwd) {
+    process.chdir(resolvePathFromCwd(options.cwd));
+  }
+
+  options.outDir = options.outDir ? resolvePathFromCwd(options.outDir) : defaultOutputDir();
+  options.authPath = resolveAuthPath(options);
+  return options;
+}
+
+function splitCommaValues(value) {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function addInputRefs(options, value) {
+  for (const ref of splitCommaValues(value)) {
+    if (/^data:image\//i.test(ref) || /^https?:\/\//i.test(ref)) {
+      options.imageUrls.push(ref);
+    } else {
+      options.imagePaths.push(ref);
+    }
+  }
+}
+
+function logVerbose(options, message) {
+  if (options.verbose) {
+    console.error(message);
+  }
+}
+
+function logProgress(options, message) {
+  if (!options.quiet) {
+    console.error(message);
+  }
+}
+
+function base64UrlDecode(input) {
+  const padded = input.padEnd(input.length + ((4 - (input.length % 4)) % 4), "=");
+  const normalized = padded.replace(/-/g, "+").replace(/_/g, "/");
+  return Buffer.from(normalized, "base64").toString("utf8");
+}
+
+function decodeJwtPayload(token) {
+  const parts = token.split(".");
+  if (parts.length < 2) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(base64UrlDecode(parts[1]));
+  } catch {
+    return null;
+  }
+}
+
+async function readAuth(authPath) {
+  const raw = await fs.readFile(authPath, "utf8");
+  const auth = JSON.parse(raw);
+  return parseAuthJson(auth, authPath);
+}
+
+async function readAuthWithOptions(authPath, options) {
+  const raw = await fs.readFile(authPath, "utf8");
+  const auth = JSON.parse(raw);
+  return parseAuthJson(auth, authPath, options);
+}
+
+function normalizeExpiresMs(value) {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  return value > 10_000_000_000 ? value : value * 1000;
+}
+
+function profileAccess(profile) {
+  return profile.access ?? profile.access_token ?? profile.token ?? null;
+}
+
+function profileRefresh(profile) {
+  return profile.refresh ?? profile.refresh_token ?? null;
+}
+
+function profileAccountId(profile) {
+  return profile.accountId ?? profile.account_id ?? profile.account ?? null;
+}
+
+function readSiblingAuthState(authPath) {
+  const statePath = path.join(path.dirname(authPath), "auth-state.json");
+  if (!existingFileSync(statePath)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fsSync.readFileSync(statePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function scoreOpenClawProfile(profileId, profile, state) {
+  let score = 0;
+  const lastGood = state?.lastGood?.["openai-codex"];
+  if (lastGood && profileId === lastGood) {
+    score += 1_000_000;
+  }
+  if (profileId === "openai-codex:default") {
+    score += 1000;
+  }
+  const expiresMs = normalizeExpiresMs(profile.expires);
+  if (expiresMs) {
+    score += Math.min(999_999, Math.max(0, Math.floor((expiresMs - Date.now()) / 1000)));
+  }
+  if (profile.email) {
+    score += 100;
+  }
+  if (profileAccountId(profile)) {
+    score += 100;
+  }
+  return score;
+}
+
+function selectOpenClawProfile(store, authPath, options = {}) {
+  const profiles = store.profiles ?? {};
+  const requested = options.authProfile?.trim();
+  if (requested) {
+    const profile = profiles[requested];
+    if (!profile) {
+      throw new Error(`OpenClaw auth profile not found in ${authPath}: ${requested}`);
+    }
+    return { profileId: requested, profile };
+  }
+
+  const state = readSiblingAuthState(authPath);
+  const lastGood = state?.lastGood?.["openai-codex"];
+  if (lastGood && profiles[lastGood]?.type === "oauth" && profiles[lastGood]?.provider === "openai-codex") {
+    return { profileId: lastGood, profile: profiles[lastGood] };
+  }
+
+  const candidates = Object.entries(profiles).filter(
+    ([, profile]) => profile?.type === "oauth" && profile.provider === "openai-codex"
+  );
+  candidates.sort(
+    ([leftId, leftProfile], [rightId, rightProfile]) =>
+      scoreOpenClawProfile(rightId, rightProfile, state) -
+      scoreOpenClawProfile(leftId, leftProfile, state)
+  );
+
+  if (candidates.length === 0) {
+    throw new Error(`No openai-codex OAuth profile found in ${authPath}`);
+  }
+
+  const [profileId, profile] = candidates[0];
+  return { profileId, profile };
+}
+
+function selectProviderMapProfile(record, authPath, options = {}) {
+  const requested = options.authProfile?.trim();
+  const provider = requested?.includes(":") ? requested.split(":")[0] : requested;
+  const key = provider || "openai-codex";
+  const profile = record[key];
+  if (!profile) {
+    throw new Error(`No ${key} OAuth credential found in ${authPath}`);
+  }
+  return { profileId: `${key}:default`, profile: { ...profile, provider: key } };
+}
+
+function buildAuthResult(params) {
+  const accessToken = profileAccess(params.profile);
+  const refreshToken = profileRefresh(params.profile);
+  const accountId = profileAccountId(params.profile);
+
+  if (!accessToken) {
+    throw new Error(`No access token found in ${params.authPath}`);
+  }
+
+  if (!accountId) {
+    throw new Error(`No accountId found in ${params.authPath}`);
+  }
+
+  const tokenPayload = decodeJwtPayload(accessToken);
+  const expiresMs = normalizeExpiresMs(params.profile.expires) ?? (tokenPayload?.exp ? tokenPayload.exp * 1000 : null);
+
   return {
-    id: item.id,
-    status: item.status,
-    revisedPrompt: item.revisedPrompt ?? item.revised_prompt ?? null,
-    savedPath: item.savedPath ?? item.saved_path ?? null,
-    decodedPath,
-    mimeType: decoded.mimeType,
-    bytes: decoded.bytes.length,
+    accessToken,
+    accountId,
+    authJson: params.authJson,
+    authPath: params.authPath,
+    authFormat: params.authFormat,
+    authMode: params.authMode ?? null,
+    expiresMs,
+    lastRefresh: params.lastRefresh ?? null,
+    profileId: params.profileId ?? null,
+    refreshToken,
+    tokenPayload,
   };
 }
 
-function imagePaths(state) {
-  return [...state.imageItems, ...state.rawImageItems].map((image) => image.decodedPath).filter(Boolean);
+function parseAuthJson(auth, authPath, options = {}) {
+  if (auth.tokens && typeof auth.tokens === "object") {
+    return buildAuthResult({
+      authJson: auth,
+      authPath,
+      authFormat: "codex-auth-json",
+      authMode: auth.auth_mode ?? null,
+      lastRefresh: auth.last_refresh ?? null,
+      profile: {
+        access: auth.tokens.access_token,
+        refresh: auth.tokens.refresh_token,
+        accountId: auth.tokens.account_id,
+      },
+    });
+  }
+
+  if (auth.profiles && typeof auth.profiles === "object") {
+    const { profileId, profile } = selectOpenClawProfile(auth, authPath, options);
+    return buildAuthResult({
+      authJson: auth,
+      authPath,
+      authFormat: "openclaw-auth-profiles",
+      profileId,
+      profile,
+    });
+  }
+
+  const { profileId, profile } = selectProviderMapProfile(auth, authPath, options);
+  return buildAuthResult({
+    authJson: auth,
+    authPath,
+    authFormat: path.basename(authPath) === "oauth.json" ? "openclaw-oauth-json" : "openclaw-legacy-auth-json",
+    profileId,
+    profile,
+  });
 }
 
-function printOutput(opts, summary, state = null) {
-  if (opts.json || opts.smoke) {
-    console.log(JSON.stringify(summary, null, 2));
+function tokenSecondsLeft(tokenPayload, expiresMs = null) {
+  if (!tokenPayload?.exp) {
+    if (!expiresMs) {
+      return null;
+    }
+    return Math.floor((expiresMs - Date.now()) / 1000);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  return tokenPayload.exp - now;
+}
+
+function staleRefreshReason(auth, options) {
+  const secondsLeft = tokenSecondsLeft(auth.tokenPayload, auth.expiresMs);
+  if (secondsLeft !== null) {
+    if (secondsLeft <= options.refreshSkewSeconds) {
+      return secondsLeft <= 0
+        ? "access token expired"
+        : `access token expires soon (${secondsLeft}s)`;
+    }
+    return null;
+  }
+
+  if (!auth.lastRefresh) {
+    return null;
+  }
+
+  const lastRefreshMs = Date.parse(auth.lastRefresh);
+  if (Number.isNaN(lastRefreshMs)) {
+    return null;
+  }
+
+  const eightDaysMs = 8 * 24 * 60 * 60 * 1000;
+  if (lastRefreshMs < Date.now() - eightDaysMs) {
+    return "last_refresh is older than 8 days";
+  }
+
+  return null;
+}
+
+async function readPrompt(options) {
+  if (options.promptFile) {
+    return fs.readFile(options.promptFile, "utf8");
+  }
+
+  return options.prompt;
+}
+
+function localImageLabelText(index) {
+  return `[Image #${index + 1}]`;
+}
+
+function localImageOpenTagText(index) {
+  return `<image name=${localImageLabelText(index)}>`;
+}
+
+function imageCloseTagText() {
+  return "</image>";
+}
+
+function detectImageMime(bytes, imagePath = "") {
+  if (
+    bytes.length >= 8 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47 &&
+    bytes[4] === 0x0d &&
+    bytes[5] === 0x0a &&
+    bytes[6] === 0x1a &&
+    bytes[7] === 0x0a
+  ) {
+    return "image/png";
+  }
+
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "image/jpeg";
+  }
+
+  if (bytes.length >= 6) {
+    const gifHeader = bytes.subarray(0, 6).toString("ascii");
+    if (gifHeader === "GIF87a" || gifHeader === "GIF89a") {
+      return "image/gif";
+    }
+  }
+
+  if (
+    bytes.length >= 12 &&
+    bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+    bytes.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+
+  const ext = path.extname(imagePath).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".webp") return "image/webp";
+
+  return null;
+}
+
+async function localImageToInputImage(imagePath, options) {
+  const absolutePath = path.resolve(imagePath);
+  const bytes = await fs.readFile(absolutePath);
+  const mime = detectImageMime(bytes, absolutePath);
+
+  if (!mime) {
+    throw new Error(`Unsupported image format for ${absolutePath}. Supported: PNG, JPEG, GIF, WebP.`);
+  }
+
+  const imageUrl = `data:${mime};base64,${bytes.toString("base64")}`;
+  if (imageUrl.length > LARGE_DATA_URL_WARNING_BYTES) {
+    logProgress(
+      options,
+      `codex-imagen: warning: reference image is large after base64 (${imageUrl.length} bytes): ${absolutePath}`
+    );
+  }
+
+  return {
+    image_url: imageUrl,
+    metadata: {
+      path: absolutePath,
+      bytes: bytes.length,
+      mime,
+      data_url_bytes: imageUrl.length,
+    },
+  };
+}
+
+function urlToInputImage(imageUrl, options) {
+  if (!/^data:image\//i.test(imageUrl) && !/^https?:\/\//i.test(imageUrl)) {
+    throw new Error(`--image-url must be http(s) or data:image URL: ${imageUrl}`);
+  }
+
+  if (imageUrl.length > LARGE_DATA_URL_WARNING_BYTES) {
+    logProgress(
+      options,
+      `codex-imagen: warning: reference image URL is large (${imageUrl.length} bytes)`
+    );
+  }
+
+  return {
+    image_url: imageUrl,
+    metadata: {
+      url: /^data:/i.test(imageUrl) ? "data:image/..." : imageUrl,
+      data_url_bytes: /^data:/i.test(imageUrl) ? imageUrl.length : null,
+    },
+  };
+}
+
+async function buildPromptContent(options, prompt) {
+  const refs = [];
+
+  for (const imagePath of options.imagePaths) {
+    refs.push(await localImageToInputImage(imagePath, options));
+  }
+
+  for (const imageUrl of options.imageUrls) {
+    refs.push(urlToInputImage(imageUrl, options));
+  }
+
+  const content = [];
+  refs.forEach((ref, index) => {
+    content.push({ type: "input_text", text: localImageOpenTagText(index) });
+    content.push({
+      type: "input_image",
+      image_url: ref.image_url,
+      detail: options.imageDetail,
+    });
+    content.push({ type: "input_text", text: imageCloseTagText() });
+  });
+  content.push({ type: "input_text", text: prompt });
+
+  if (refs.length > 0) {
+    logProgress(options, `codex-imagen: attached ${refs.length} reference image(s)`);
+    refs.forEach((ref, index) => {
+      const source = ref.metadata.path ?? ref.metadata.url ?? "image";
+      const size = ref.metadata.bytes ? `, ${ref.metadata.bytes} bytes` : "";
+      const mime = ref.metadata.mime ? `, ${ref.metadata.mime}` : "";
+      logVerbose(options, `reference ${index + 1}: ${source}${mime}${size}`);
+    });
+  }
+
+  return {
+    content,
+    metadata: refs.map((ref, index) => ({
+      index: index + 1,
+      label: localImageLabelText(index),
+      ...ref.metadata,
+    })),
+  };
+}
+
+async function buildResponsesBody(options, prompt, requestId) {
+  const promptContent = await buildPromptContent(options, prompt);
+  return {
+    model: options.model,
+    instructions: "",
+    input: [
+      {
+        type: "message",
+        role: "user",
+        content: promptContent.content,
+      },
+    ],
+    tools: [
+      {
+        type: "image_generation",
+        output_format: "png",
+      },
+    ],
+    tool_choice: "auto",
+    parallel_tool_calls: false,
+    prompt_cache_key: requestId,
+    stream: options.stream,
+    store: false,
+    reasoning: null,
+  };
+}
+
+function buildHeaders(auth, requestId, sessionId) {
+  return {
+    "accept": "text/event-stream, application/json",
+    "authorization": `Bearer ${auth.accessToken}`,
+    "chatgpt-account-id": auth.accountId,
+    "content-type": "application/json",
+    "originator": "codex_cli_rs",
+    "session_id": sessionId,
+    "user-agent": `codex-imagen/${PACKAGE_VERSION}`,
+    "version": "0.122.0",
+    "x-client-request-id": requestId,
+  };
+}
+
+function buildRefreshHeaders() {
+  return {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "originator": "codex_cli_rs",
+    "user-agent": `codex-imagen/${PACKAGE_VERSION}`,
+    "version": "0.122.0",
+  };
+}
+
+function tryParseJson(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function refreshErrorCode(body) {
+  const parsed = tryParseJson(body);
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+
+  if (typeof parsed.error === "string") {
+    return parsed.error;
+  }
+
+  if (parsed.error && typeof parsed.error === "object" && typeof parsed.error.code === "string") {
+    return parsed.error.code;
+  }
+
+  if (typeof parsed.code === "string") {
+    return parsed.code;
+  }
+
+  return null;
+}
+
+function refreshFailureMessage(status, body) {
+  const code = refreshErrorCode(body);
+
+  if (status === 401) {
+    if (code === "refresh_token_expired") {
+      return "Refresh token expired. Run `codex logout` and sign in again.";
+    }
+    if (code === "refresh_token_reused") {
+      return "Refresh token was already used. Run `codex logout` and sign in again.";
+    }
+    if (code === "refresh_token_invalidated") {
+      return "Refresh token was revoked. Run `codex logout` and sign in again.";
+    }
+    return "Refresh token was rejected. Run `codex logout` and sign in again.";
+  }
+
+  const parsed = tryParseJson(body);
+  const message =
+    parsed?.error?.message ??
+    parsed?.error_description ??
+    parsed?.message ??
+    body.trim() ??
+    "(empty response)";
+  return `Refresh request failed: HTTP ${status}: ${message}`;
+}
+
+async function writeAuthJsonAtomic(authPath, authJson) {
+  await fs.mkdir(path.dirname(authPath), { recursive: true });
+  const tempPath = path.join(
+    path.dirname(authPath),
+    `.${path.basename(authPath)}.${process.pid}.${Date.now()}.tmp`
+  );
+  const data = `${JSON.stringify(authJson, null, 2)}\n`;
+  await fs.writeFile(tempPath, data, { mode: 0o600 });
+  await fs.rename(tempPath, authPath);
+  try {
+    await fs.chmod(authPath, 0o600);
+  } catch (error) {
+    if (process.platform !== "win32") {
+      throw error;
+    }
+  }
+}
+
+function mergeRefreshResponse(authJson, refreshResponse) {
+  const nextAuthJson = structuredClone(authJson);
+  const tokens = nextAuthJson.tokens ?? {};
+  nextAuthJson.tokens = tokens;
+
+  if (refreshResponse.id_token) {
+    tokens.id_token = refreshResponse.id_token;
+  }
+  if (refreshResponse.access_token) {
+    tokens.access_token = refreshResponse.access_token;
+  }
+  if (refreshResponse.refresh_token) {
+    tokens.refresh_token = refreshResponse.refresh_token;
+  }
+
+  nextAuthJson.last_refresh = new Date().toISOString();
+  return nextAuthJson;
+}
+
+function refreshedExpiresMs(refreshResponse) {
+  if (typeof refreshResponse.expires_at === "number") {
+    return normalizeExpiresMs(refreshResponse.expires_at);
+  }
+  if (typeof refreshResponse.expires_in === "number") {
+    return Date.now() + refreshResponse.expires_in * 1000;
+  }
+  const payload = refreshResponse.access_token ? decodeJwtPayload(refreshResponse.access_token) : null;
+  return payload?.exp ? payload.exp * 1000 : null;
+}
+
+function mergeRefreshResponseForAuth(auth, currentAuth, refreshResponse) {
+  if (currentAuth.authFormat === "codex-auth-json") {
+    return mergeRefreshResponse(currentAuth.authJson, refreshResponse);
+  }
+
+  const nextAuthJson = structuredClone(currentAuth.authJson);
+  const profileId = currentAuth.profileId;
+
+  if (currentAuth.authFormat === "openclaw-auth-profiles") {
+    const profile = nextAuthJson.profiles?.[profileId];
+    if (!profile) {
+      throw new Error(`OpenClaw profile disappeared during refresh: ${profileId}`);
+    }
+    if (refreshResponse.access_token) {
+      profile.access = refreshResponse.access_token;
+    }
+    if (refreshResponse.refresh_token) {
+      profile.refresh = refreshResponse.refresh_token;
+    }
+    const expires = refreshedExpiresMs(refreshResponse);
+    if (expires) {
+      profile.expires = expires;
+    }
+    if (refreshResponse.id_token) {
+      profile.idToken = refreshResponse.id_token;
+    }
+    return nextAuthJson;
+  }
+
+  const provider = profileId?.includes(":") ? profileId.split(":")[0] : "openai-codex";
+  const profile = nextAuthJson[provider];
+  if (!profile) {
+    throw new Error(`OpenClaw OAuth entry disappeared during refresh: ${provider}`);
+  }
+  if (refreshResponse.access_token) {
+    profile.access = refreshResponse.access_token;
+  }
+  if (refreshResponse.refresh_token) {
+    profile.refresh = refreshResponse.refresh_token;
+  }
+  const expires = refreshedExpiresMs(refreshResponse);
+  if (expires) {
+    profile.expires = expires;
+  }
+  if (refreshResponse.id_token) {
+    profile.idToken = refreshResponse.id_token;
+  }
+  return nextAuthJson;
+}
+
+async function refreshAuth(options, auth, reason) {
+  if (!options.refresh) {
+    throw new Error(`Codex OAuth refresh is disabled, but refresh is required: ${reason}`);
+  }
+
+  if (!auth.refreshToken) {
+    throw new Error(`No refresh token found in ${auth.authPath}`);
+  }
+
+  logVerbose(options, `refresh: ${reason}`);
+  logVerbose(options, `refresh_endpoint: ${options.refreshUrl}`);
+
+  const response = await fetch(options.refreshUrl, {
+    method: "POST",
+    headers: buildRefreshHeaders(),
+    body: JSON.stringify({
+      client_id: CODEX_OAUTH_CLIENT_ID,
+      grant_type: "refresh_token",
+      refresh_token: auth.refreshToken,
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    const currentAuth = await readAuthWithOptions(auth.authPath, { authProfile: auth.profileId }).catch(() => null);
+    if (currentAuth?.refreshToken && currentAuth.refreshToken !== auth.refreshToken) {
+      logVerbose(options, "refresh skipped: auth.json changed while refresh was in progress");
+      return { auth: currentAuth, refreshed: false, skipped: "auth changed" };
+    }
+    throw new Error(refreshFailureMessage(response.status, body));
+  }
+
+  const refreshResponse = await response.json();
+  const currentAuth = await readAuthWithOptions(auth.authPath, { authProfile: auth.profileId });
+  if (currentAuth.refreshToken !== auth.refreshToken) {
+    logVerbose(options, "refresh skipped: auth.json changed before persist");
+    return { auth: currentAuth, refreshed: false, skipped: "auth changed" };
+  }
+
+  const nextAuthJson = mergeRefreshResponseForAuth(auth, currentAuth, refreshResponse);
+  await writeAuthJsonAtomic(auth.authPath, nextAuthJson);
+  const nextAuth = await readAuthWithOptions(auth.authPath, { authProfile: currentAuth.profileId });
+
+  return { auth: nextAuth, refreshed: true, skipped: null };
+}
+
+async function prepareAuth(options) {
+  let auth = await readAuthWithOptions(options.authPath, options);
+
+  if (auth.authMode && auth.authMode !== "chatgpt") {
+    console.error(`warning: auth_mode is ${auth.authMode}, expected chatgpt.`);
+  }
+
+  let refresh = null;
+  const reason = options.forceRefresh ? "forced refresh" : staleRefreshReason(auth, options);
+
+  if (reason) {
+    refresh = await refreshAuth(options, auth, reason);
+    auth = refresh.auth;
+  }
+
+  return { auth, refresh };
+}
+
+function parseSseEvent(block) {
+  const event = { type: "message", data: "" };
+  const data = [];
+
+  for (const rawLine of block.split(/\r?\n/)) {
+    if (!rawLine || rawLine.startsWith(":")) {
+      continue;
+    }
+
+    const separator = rawLine.indexOf(":");
+    const field = separator === -1 ? rawLine : rawLine.slice(0, separator);
+    let value = separator === -1 ? "" : rawLine.slice(separator + 1);
+    if (value.startsWith(" ")) {
+      value = value.slice(1);
+    }
+
+    if (field === "event") {
+      event.type = value;
+    } else if (field === "data") {
+      data.push(value);
+    }
+  }
+
+  event.data = data.join("\n");
+  return event;
+}
+
+function collectImageGenerationCalls(value, calls = []) {
+  if (!value || typeof value !== "object") {
+    return calls;
+  }
+
+  if (value.type === "image_generation_call") {
+    calls.push(value);
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectImageGenerationCalls(item, calls);
+    }
+    return calls;
+  }
+
+  for (const [key, child] of Object.entries(value)) {
+    if (key === "result" && typeof child === "string") {
+      continue;
+    }
+    collectImageGenerationCalls(child, calls);
+  }
+
+  return calls;
+}
+
+function mergeImageCall(previous, next) {
+  if (!previous) {
+    return next;
+  }
+
+  const merged = { ...previous, ...next };
+
+  if (previous.result && !next.result) {
+    merged.result = previous.result;
+  }
+
+  if (previous.revised_prompt && !next.revised_prompt) {
+    merged.revised_prompt = previous.revised_prompt;
+  }
+
+  if (previous.status === "completed" && next.status !== "completed") {
+    merged.status = "completed";
+  }
+
+  if (next.status === "completed") {
+    merged.status = "completed";
+  }
+
+  if (previous.partial === false || next.partial === false) {
+    merged.partial = false;
+  } else if (previous.partial === true || next.partial === true) {
+    merged.partial = true;
+  }
+
+  return merged;
+}
+
+function imageCallsFromPayload(payload, payloadType) {
+  const calls = collectImageGenerationCalls(payload);
+  const finalishEvent = payloadType === "response.output_item.done" || payloadType === "response.completed";
+
+  if (payload?.type === "response.image_generation_call.partial_image" && payload.partial_image_b64) {
+    calls.push({
+      type: "image_generation_call",
+      id: payload.item_id ?? null,
+      status: "partial_image",
+      result: payload.partial_image_b64,
+      partial: true,
+      partial_image_index: payload.partial_image_index ?? null,
+    });
+  }
+
+  return calls.map((call) => ({
+    ...call,
+    partial: call.partial ?? !finalishEvent,
+  }));
+}
+
+function eventTypeFromPayload(payload) {
+  if (!payload || typeof payload !== "object") {
+    return typeof payload;
+  }
+
+  return payload.type ?? payload.event ?? payload.item?.type ?? "object";
+}
+
+async function parseStreamingResponse(response, options, onImageCall, streamState = {}) {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const imageCalls = new Map();
+  const seenEventTypes = streamState.seenEventTypes ?? new Set();
+  streamState.seenEventTypes = seenEventTypes;
+  const progressEvents = new Set();
+
+  const noteProgress = (payloadType) => {
+    if (progressEvents.has(payloadType)) {
+      return;
+    }
+    progressEvents.add(payloadType);
+
+    if (payloadType === "response.created") {
+      logProgress(options, "codex-imagen: request accepted");
+    } else if (payloadType === "response.image_generation_call.in_progress") {
+      logProgress(options, "codex-imagen: image generation started");
+    } else if (payloadType === "response.image_generation_call.generating") {
+      logProgress(options, "codex-imagen: image generation running");
+    } else if (payloadType === "response.image_generation_call.partial_image") {
+      logProgress(options, "codex-imagen: image bytes received");
+    } else if (payloadType === "response.completed") {
+      logProgress(options, "codex-imagen: response completed");
+    }
+  };
+
+  const recordImageCall = async (call) => {
+    const key = call.id ?? `call-${imageCalls.size + 1}`;
+    const merged = mergeImageCall(imageCalls.get(key), call);
+    imageCalls.set(key, merged);
+
+    if (onImageCall) {
+      await onImageCall(merged, key);
+    }
+  };
+
+  for await (const chunk of response.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+
+    while (true) {
+      const match = buffer.match(/\r?\n\r?\n/);
+      if (!match) {
+        break;
+      }
+
+      const block = buffer.slice(0, match.index);
+      buffer = buffer.slice(match.index + match[0].length);
+      const sse = parseSseEvent(block);
+
+      if (!sse.data || sse.data === "[DONE]") {
+        continue;
+      }
+
+      let payload;
+      try {
+        payload = JSON.parse(sse.data);
+      } catch {
+        seenEventTypes.add(`unparsed:${sse.type}`);
+        continue;
+      }
+
+      const payloadType = eventTypeFromPayload(payload);
+      seenEventTypes.add(payloadType);
+      logVerbose(options, `event: ${payloadType}`);
+      noteProgress(payloadType);
+
+      for (const call of imageCallsFromPayload(payload, payloadType)) {
+        await recordImageCall(call);
+      }
+    }
+  }
+
+  const tail = decoder.decode();
+  if (tail) {
+    buffer += tail;
+  }
+
+  if (buffer.trim()) {
+    const sse = parseSseEvent(buffer.trim());
+    if (sse.data && sse.data !== "[DONE]") {
+      try {
+        const payload = JSON.parse(sse.data);
+        const payloadType = eventTypeFromPayload(payload);
+        seenEventTypes.add(payloadType);
+        logVerbose(options, `event: ${payloadType}`);
+        noteProgress(payloadType);
+        for (const call of imageCallsFromPayload(payload, payloadType)) {
+          await recordImageCall(call);
+        }
+      } catch {
+        seenEventTypes.add(`unparsed:${sse.type}`);
+      }
+    }
+  }
+
+  return {
+    imageCalls: [...imageCalls.values()],
+    seenEventTypes: [...seenEventTypes],
+  };
+}
+
+async function parseJsonResponse(response) {
+  const payload = await response.json();
+  const payloadType = eventTypeFromPayload(payload);
+  return {
+    imageCalls: imageCallsFromPayload(payload, payloadType),
+    seenEventTypes: [payloadType],
+    payload,
+  };
+}
+
+function timestampForPath() {
+  return new Date()
+    .toISOString()
+    .replace(/\.\d+Z$/, "Z")
+    .replace(/[-:]/g, "")
+    .replace("T", "-");
+}
+
+function safeCallId(imageCall) {
+  return imageCall.id ? imageCall.id.replace(/[^a-zA-Z0-9_.-]/g, "_") : "image";
+}
+
+function paddedIndex(index, total) {
+  const width = total && total > 1 ? String(total).length : 1;
+  return String(index + 1).padStart(width, "0");
+}
+
+function autoImageName(imageCall, index, total, timestamp) {
+  const imageIndex = total === null || total > 1 ? `${paddedIndex(index, total)}-` : "";
+  return `codex-imagen-${timestamp}-${imageIndex}${safeCallId(imageCall)}.png`;
+}
+
+function looksLikeDirectoryOutput(output) {
+  return output.endsWith("/") || output.endsWith("\\") || path.extname(output) === "";
+}
+
+function numberedOutputPath(outputPath, index, total) {
+  if (total === 1) {
+    return outputPath;
+  }
+
+  const parsed = path.parse(outputPath);
+  return path.join(parsed.dir, `${parsed.name}-${paddedIndex(index, total)}${parsed.ext || ".png"}`);
+}
+
+function outputPathFor(options, imageCall, index, total, timestamp) {
+  if (options.output) {
+    const output = path.resolve(options.output);
+
+    if (looksLikeDirectoryOutput(options.output)) {
+      return path.join(output, autoImageName(imageCall, index, total, timestamp));
+    }
+
+    if (total === null && index === 0) {
+      return output;
+    }
+
+    return numberedOutputPath(output, index, total);
+  }
+
+  return path.resolve(options.outDir, autoImageName(imageCall, index, total, timestamp));
+}
+
+async function saveImageCall(options, imageCall, index, total, timestamp) {
+  if (!imageCall.result) {
+    throw new Error(`Image call ${imageCall.id ?? "(no id)"} had no base64 result`);
+  }
+
+  const outputPath = outputPathFor(options, imageCall, index, total, timestamp);
+  return writeImageCallToPath(imageCall, outputPath);
+}
+
+async function writeImageCallToPath(imageCall, outputPath) {
+  await fs.mkdir(path.dirname(outputPath), { recursive: true });
+  const bytes = Buffer.from(imageCall.result, "base64");
+  await fs.writeFile(outputPath, bytes);
+
+  return {
+    path: outputPath,
+    decodedPath: outputPath,
+    bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    call_id: imageCall.id ?? null,
+    status: imageCall.status ?? null,
+    partial: imageCall.partial ?? null,
+    revised_prompt: imageCall.revised_prompt ?? null,
+  };
+}
+
+async function renumberFirstFileOutputForMulti(options, images) {
+  if (!options.output || looksLikeDirectoryOutput(options.output) || images.length !== 1) {
     return;
   }
-  const paths = state ? imagePaths(state) : [];
-  for (const imagePath of paths) {
-    console.log(imagePath);
+
+  const exactOutput = path.resolve(options.output);
+  if (images[0].path !== exactOutput) {
+    return;
+  }
+
+  const numberedOutput = numberedOutputPath(exactOutput, 0, null);
+  if (numberedOutput === exactOutput) {
+    return;
+  }
+
+  await fs.rename(exactOutput, numberedOutput);
+  images[0].path = numberedOutput;
+  logProgress(options, `codex-imagen: renamed first image for multi-output: ${numberedOutput}`);
+}
+
+function createStreamingImageSaver(options) {
+  const images = [];
+  const savedByKey = new Map();
+  const batchTimestamp = timestampForPath();
+
+  return {
+    images,
+    async maybeSave(imageCall, key) {
+      if (!imageCall.result) {
+        return null;
+      }
+
+      const existing = savedByKey.get(key);
+      if (existing) {
+        const previousSha = existing.sha256;
+        const updated = await writeImageCallToPath(imageCall, existing.path);
+        Object.assign(existing, updated);
+        if (updated.sha256 !== previousSha) {
+          logProgress(options, `codex-imagen: updated image ${images.indexOf(existing) + 1}: ${existing.path}`);
+        }
+        return existing;
+      }
+
+      await renumberFirstFileOutputForMulti(options, images);
+      const image = await saveImageCall(options, imageCall, images.length, null, batchTimestamp);
+      savedByKey.set(key, image);
+      images.push(image);
+      logProgress(options, `codex-imagen: saved image ${images.length}: ${image.path}`);
+      return image;
+    },
+  };
+}
+
+function buildResult({ requestId, sessionId, endpoint, model, images, seenEventTypes, timedOut = false }) {
+  return {
+    request_id: requestId,
+    session_id: sessionId,
+    endpoint,
+    model,
+    image_count: images.length,
+    imageCount: images.length,
+    images,
+    seen_event_types: seenEventTypes,
+    timed_out: timedOut,
+  };
+}
+
+async function requestImage(options, prompt, auth) {
+  const requestId = randomUUID();
+  const sessionId = randomUUID();
+  const endpoint = `${options.baseUrl.replace(/\/+$/, "")}/responses`;
+  const body = await buildResponsesBody(options, prompt, requestId);
+  const streamState = { seenEventTypes: new Set() };
+  const streamingSaver = createStreamingImageSaver(options);
+  const abortController = new AbortController();
+  const timeout = options.timeoutMs > 0
+    ? setTimeout(() => abortController.abort(), options.timeoutMs)
+    : null;
+
+  logProgress(options, `codex-imagen: POST ${endpoint}`);
+  logProgress(options, `codex-imagen: model ${options.model}`);
+  logVerbose(options, `request_id: ${requestId}`);
+
+  try {
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: buildHeaders(auth, requestId, sessionId),
+      body: JSON.stringify(body),
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      const preview = text.length > 4000 ? `${text.slice(0, 4000)}...` : text;
+      throw new HttpStatusError(response.status, response.statusText, preview);
+    }
+
+    const parsed = options.stream
+      ? await parseStreamingResponse(response, options, (call, key) => streamingSaver.maybeSave(call, key), streamState)
+      : await parseJsonResponse(response);
+
+    const images = options.stream
+      ? streamingSaver.images
+      : await saveImageCallsAtEnd(options, parsed.imageCalls);
+
+    if (images.length === 0) {
+      throw new Error(
+        `No completed image_generation_call with result found. Seen event types: ${parsed.seenEventTypes.join(", ") || "(none)"}`
+      );
+    }
+
+    return buildResult({
+      requestId,
+      sessionId,
+      endpoint,
+      model: options.model,
+      images,
+      seenEventTypes: parsed.seenEventTypes,
+    });
+  } catch (error) {
+    if (abortController.signal.aborted && streamingSaver.images.length > 0) {
+      logProgress(
+        options,
+        `codex-imagen: timed out after ${options.timeoutMs}ms; returning ${streamingSaver.images.length} saved image(s)`
+      );
+      return buildResult({
+        requestId,
+        sessionId,
+        endpoint,
+        model: options.model,
+        images: streamingSaver.images,
+        seenEventTypes: [...streamState.seenEventTypes],
+        timedOut: true,
+      });
+    }
+
+    if (abortController.signal.aborted) {
+      throw new Error(`Timed out after ${options.timeoutMs}ms before any image was saved.`);
+    }
+
+    throw error;
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
   }
 }
 
-async function withTimeout(promise, timeoutMs, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      const error = new Error(`${label} timed out after ${timeoutMs}ms`);
-      error.code = "TURN_TIMEOUT";
-      reject(error);
-    }, timeoutMs);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer);
+async function saveImageCallsAtEnd(options, imageCalls) {
+  const callsWithImages = imageCalls.filter((call) => call.result);
+  const batchTimestamp = timestampForPath();
+  return Promise.all(
+    callsWithImages.map((call, index) =>
+      saveImageCall(options, call, index, callsWithImages.length, batchTimestamp)
+    )
+  );
+}
+
+class HttpStatusError extends Error {
+  constructor(status, statusText, body) {
+    super(`HTTP ${status} ${statusText}\n${body}`);
+    this.name = "HttpStatusError";
+    this.status = status;
+    this.statusText = statusText;
+    this.body = body;
+  }
+}
+
+function authSummary(auth, options) {
+  return {
+    auth_path: auth.authPath,
+    auth_format: auth.authFormat,
+    auth_mode: auth.authMode,
+    profile_id: auth.profileId,
+    account_id: auth.accountId,
+    last_refresh: auth.lastRefresh,
+    access_token_expires_in_seconds: tokenSecondsLeft(auth.tokenPayload, auth.expiresMs),
+    refresh_token_present: Boolean(auth.refreshToken),
+    endpoint: `${options.baseUrl.replace(/\/+$/, "")}/responses`,
+    model: options.model,
+    out_dir: options.outDir,
+  };
+}
+
+function printSmoke(auth, options) {
+  const summary = authSummary(auth, options);
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    return;
+  }
+
+  for (const [key, value] of Object.entries(summary)) {
+    process.stdout.write(`${key}: ${value ?? ""}\n`);
   }
 }
 
 async function main() {
-  const opts = parseArgs(process.argv.slice(2));
-  fs.mkdirSync(opts.outDir, { recursive: true });
-  debugLog(opts, `using Codex binary: ${opts.codexBin} (${opts.codexBinSource})`);
-  debugLog(opts, `writing images to: ${opts.outDir}`);
-  if (opts.logPath) debugLog(opts, `writing redacted app-server trace to: ${opts.logPath}`);
-  const client = new CodexAppServerClient(opts);
-  client.start();
+  let options = parseArgs(process.argv.slice(2));
 
+  if (options.help) {
+    process.stdout.write(usage());
+    return;
+  }
+
+  if (options.version) {
+    process.stdout.write(`${PACKAGE_VERSION}\n`);
+    return;
+  }
+
+  options = normalizeOptions(options);
+
+  if (options.smoke) {
+    const { auth } = options.forceRefresh
+      ? await prepareAuth(options)
+      : { auth: await readAuthWithOptions(options.authPath, options) };
+    printSmoke(auth, options);
+    return;
+  }
+
+  let { auth, refresh } = await prepareAuth(options);
+
+  if (options.refreshOnly) {
+    if (!refresh) {
+      refresh = await refreshAuth(options, auth, "refresh-only");
+      auth = refresh.auth;
+    }
+
+    if (options.json) {
+      process.stdout.write(
+        `${JSON.stringify(
+          {
+            auth_path: auth.authPath,
+            refreshed: refresh.refreshed,
+            skipped: refresh.skipped,
+            auth_format: auth.authFormat,
+            auth_mode: auth.authMode,
+            profile_id: auth.profileId,
+            account_id: auth.accountId,
+            last_refresh: auth.lastRefresh,
+            access_token_expires_in_seconds: tokenSecondsLeft(auth.tokenPayload, auth.expiresMs),
+          },
+          null,
+          2
+        )}\n`
+      );
+    } else {
+      process.stdout.write(`${auth.authPath}\n`);
+    }
+    return;
+  }
+
+  const prompt = await readPrompt(options);
+  if (!prompt?.trim()) {
+    throw new UsageError("Prompt is required. Pass it positionally, with --prompt, or with --prompt-file.");
+  }
+
+  let result;
   try {
-    const initialize = await client.request("initialize", {
-      clientInfo: {
-        name: "codex_imagen",
-        title: "Codex Imagen",
-        version: VERSION,
-      },
-      capabilities: { experimentalApi: true },
-    });
-    client.notify("initialized", {});
-
-    if (opts.smoke) {
-      const [models, skills] = await Promise.all([
-        client.request("model/list", { limit: 50, includeHidden: false }).catch((error) => ({ error: error.message })),
-        client
-          .request("skills/list", { cwds: [opts.cwd], forceReload: true })
-          .catch((error) => ({ error: error.message })),
-      ]);
-      const imagegenSkill = skills?.data
-        ?.flatMap((entry) => entry.skills || [])
-        .find((skill) => skill.name === "imagegen");
-      printOutput(opts, {
-        ok: true,
-        mode: "smoke",
-        codexBin: opts.codexBin,
-        codexBinSource: opts.codexBinSource,
-        userAgent: initialize.userAgent || null,
-        modelCount: models?.data?.length ?? null,
-        imagegenSkill: imagegenSkill
-          ? { name: imagegenSkill.name, path: imagegenSkill.path, enabled: imagegenSkill.enabled }
-          : null,
-        configuredImagegenSkillPath: opts.imagegenSkillPath,
-        usedSkillItem: Boolean(opts.imagegenSkillPath),
-        checkedImagegenSkillPaths: opts.imagegenSkillPathChecked,
-        outDir: opts.outDir,
-        outDirSource: opts.outDirSource,
-        logPath: opts.logPath,
-        logPathSource: opts.logPathSource,
-        debug: opts.debug,
-        warnings: opts.warnings,
-      });
-      return;
+    result = await requestImage(options, prompt, auth);
+  } catch (error) {
+    if (!(error instanceof HttpStatusError) || error.status !== 401 || !options.refresh) {
+      throw error;
     }
 
-    const state = {
-      threadId: null,
-      turnId: null,
-      turn: null,
-      errors: [],
-      imageItems: [],
-      rawImageItems: [],
-      agentMessages: [],
-      completed: false,
+    const retryRefresh = await refreshAuth(options, auth, "401 from Codex backend");
+    auth = retryRefresh.auth;
+    result = await requestImage(options, prompt, auth);
+    refresh = retryRefresh;
+  }
+
+  if (refresh && options.json) {
+    result.auth_refresh = {
+      refreshed: refresh.refreshed,
+      skipped: refresh.skipped,
+      last_refresh: auth.lastRefresh,
+      access_token_expires_in_seconds: tokenSecondsLeft(auth.tokenPayload, auth.expiresMs),
     };
+  }
 
-    let resolveDone;
-    const done = new Promise((resolve) => {
-      resolveDone = resolve;
-    });
-
-    client.notificationHandler = (msg) => {
-      const params = msg.params || {};
-      if (msg.method === "turn/started") {
-        state.turnId ||= params.turn?.id || null;
-      } else if (msg.method === "error") {
-        state.errors.push(params.error || params);
-      } else if (msg.method === "item/completed") {
-        const item = params.item || {};
-        if (item.type === "imageGeneration") {
-          const saved = saveImageItem(item, opts.outDir);
-          state.imageItems.push(saved);
-          if (saved.decodedPath) debugLog(opts, `saved image: ${saved.decodedPath}`);
-        } else if (item.type === "agentMessage" && typeof item.text === "string") {
-          state.agentMessages.push(item.text);
-        }
-      } else if (msg.method === "rawResponseItem/completed") {
-        const item = params.item || {};
-        if (item.type === "image_generation_call") {
-          const normalized = {
-            type: "imageGeneration",
-            id: item.id,
-            status: item.status,
-            revisedPrompt: item.revised_prompt ?? null,
-            result: item.result,
-          };
-          const saved = saveImageItem(normalized, opts.outDir);
-          state.rawImageItems.push(saved);
-          if (saved.decodedPath) debugLog(opts, `saved raw image: ${saved.decodedPath}`);
-        }
-      } else if (msg.method === "turn/completed") {
-        state.completed = true;
-        state.turn = params.turn || null;
-        state.turnId ||= params.turn?.id || null;
-        resolveDone();
-      }
-    };
-
-    const threadResponse = await client.request("thread/start", {
-      model: opts.model,
-      modelProvider: null,
-      serviceTier: "fast",
-      cwd: opts.cwd,
-      approvalPolicy: "never",
-      approvalsReviewer: "user",
-      sandbox: "danger-full-access",
-      config: IMAGE_FEATURE_CONFIG,
-      serviceName: "codex_imagen",
-      personality: "pragmatic",
-      ephemeral: true,
-      experimentalRawEvents: false,
-      persistExtendedHistory: true,
-    });
-    state.threadId = threadResponse.thread?.id || null;
-    if (!state.threadId) throw new Error(`thread/start did not return a thread id: ${JSON.stringify(threadResponse)}`);
-
-    const turnResponse = await client.request("turn/start", {
-      threadId: state.threadId,
-      input: buildInput(opts.prompt, opts),
-      cwd: opts.cwd,
-      approvalPolicy: "never",
-      approvalsReviewer: "user",
-      sandboxPolicy: { type: "dangerFullAccess" },
-      model: null,
-      serviceTier: "fast",
-      effort: null,
-      summary: "auto",
-      personality: "pragmatic",
-      outputSchema: null,
-      collaborationMode: {
-        mode: "default",
-        settings: {
-          model: opts.model,
-          reasoning_effort: opts.effort,
-          developer_instructions: null,
-        },
-      },
-    });
-    state.turnId ||= turnResponse.turn?.id || null;
-
-    let timedOut = false;
-    let timeoutMessage = null;
-    try {
-      await withTimeout(done, opts.timeoutMs, "image generation turn");
-    } catch (error) {
-      if (error?.code !== "TURN_TIMEOUT") throw error;
-      timedOut = true;
-      timeoutMessage = error.message;
-      debugLog(opts, timeoutMessage);
+  if (options.json) {
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  } else {
+    for (const image of result.images) {
+      process.stdout.write(`${image.path}\n`);
     }
-    const imageCount = state.imageItems.length + state.rawImageItems.length;
-    const ok = state.errors.length === 0 && imageCount > 0;
-
-    const summary = {
-      ok,
-      timedOut,
-      timeoutMessage,
-      imageCount,
-      threadId: state.threadId,
-      turnId: state.turnId,
-      turnStatus: state.turn?.status || null,
-      images: state.imageItems,
-      rawImages: state.rawImageItems,
-      errors: state.errors,
-      agentMessages: state.agentMessages.filter(Boolean),
-      codexBin: opts.codexBin,
-      codexBinSource: opts.codexBinSource,
-      usedSkillItem: Boolean(opts.imagegenSkillPath),
-      imagegenSkillPath: opts.imagegenSkillPath,
-      outDir: opts.outDir,
-      outDirSource: opts.outDirSource,
-      logPath: opts.logPath,
-      logPathSource: opts.logPathSource,
-      debug: opts.debug,
-      warnings: opts.warnings,
-    };
-    printOutput(opts, summary, state);
-    if (timedOut) {
-      process.exitCode = imageCount > 0 ? 4 : 124;
-    } else if (!ok) {
-      process.exitCode = 1;
-    }
-  } finally {
-    await client.close();
   }
 }
 
 main().catch((error) => {
-  if (error instanceof CliError) {
+  if (error instanceof UsageError) {
     console.error(`Error: ${error.message}`);
     process.exitCode = 2;
-  } else {
-    console.error(error?.stack || error?.message || String(error));
-    process.exitCode = 1;
+    return;
   }
+  console.error(error?.stack || error?.message || String(error));
+  process.exitCode = 1;
 });

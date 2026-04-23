@@ -1,73 +1,70 @@
 ---
 name: codex-imagen
-description: Generate raster images through the local Codex app-server using the machine's Codex/ChatGPT auth, then save decoded image files for OpenClaw workflows.
+description: Generate or edit raster images by calling the ChatGPT/Codex Responses image_generation tool directly with local Codex or OpenClaw OAuth credentials, then save decoded image files for OpenClaw and other agent workflows.
 metadata:
   openclaw:
     emoji: "🖼️"
     requires:
       bins: ["node"]
-    install:
-      - id: codex-cli
-        kind: npm
-        package: "@openai/codex"
-        bins: ["codex"]
-        label: "Install Codex CLI (npm)"
 ---
 
 # Codex Imagen
 
-Generate images by starting `codex app-server`, sending a `$imagegen` turn, and decoding every returned image into local files. This uses the local Codex installation and ChatGPT/Codex auth on the machine; it does not require `OPENAI_API_KEY`.
+Generate images by calling the ChatGPT/Codex backend directly with OAuth credentials already stored on the machine. This does not start `codex app-server`, does not need the Codex CLI binary, and does not require `OPENAI_API_KEY`.
 
 ## Quick Start
 
 Run the helper through Node for macOS, Linux, and Windows compatibility:
 
 ```bash
-node {baseDir}/scripts/codex-imagen.mjs 'can generate image follow this prompt, no refine? "a cinematic fantasy city at sunrise"'
+node {baseDir}/scripts/codex-imagen.mjs 'generate image follow this prompt, no refine: "a cinematic fantasy city at sunrise"'
 ```
 
-Normal generation prints one generated image path per line. This matches OpenClaw's artifact-oriented helper scripts, where stdout is the file handoff and diagnostics go to stderr.
+Normal generation prints one generated image path per line. Diagnostics and progress go to stderr.
 
-Use `--json` when you need the full machine-readable summary, including `images[].decodedPath`, `images[].revisedPrompt`, timing state, and app-server metadata.
+Use `--json` when the caller needs machine-readable metadata:
 
-## Runtime Checks
+```bash
+node {baseDir}/scripts/codex-imagen.mjs --json --prompt 'generate a small blue lotus icon'
+```
 
-Before generating, verify that the local Codex app-server and `imagegen` skill can be seen:
+## Auth Discovery
+
+The CLI reads existing OAuth JSON and sends `Authorization: Bearer <access>` plus `ChatGPT-Account-Id` to `https://chatgpt.com/backend-api/codex/responses`.
+
+Run a local auth check without generating:
 
 ```bash
 node {baseDir}/scripts/codex-imagen.mjs --smoke
 ```
 
-The script auto-detects the Codex binary in this order:
+Auth lookup order:
 
-1. `--codex-bin`
-2. `CODEX_IMAGEN_CODEX_BIN`
-3. `CODEX_APP_SERVER_BIN`
-4. `CODEX_BIN`
-5. macOS Codex.app bundled binary at `/Applications/Codex.app/Contents/Resources/codex`
-6. `codex` on `PATH`
-7. npm global executable locations from `npm config get prefix`
-8. common platform locations:
-   - Linux/macOS: Node's own bin directory, `~/.local/bin`, `~/.npm-global/bin`, `~/bin`, Homebrew paths, `/usr/local/bin`, `/usr/bin`, `/bin`, `/snap/bin`
-   - Windows: `%APPDATA%\npm`, `%LOCALAPPDATA%\Microsoft\WindowsApps`, `%ProgramFiles%\nodejs`, `%ProgramFiles(x86)%\nodejs`
-9. Codex release archive names for the current platform, such as `codex-x86_64-unknown-linux-musl`
+1. `--auth`
+2. `CODEX_IMAGEN_AUTH_JSON`, `OPENCLAW_CODEX_AUTH_JSON`, `CODEX_AUTH_JSON`
+3. `OPENCLAW_AGENT_DIR/auth-profiles.json` or `PI_CODING_AGENT_DIR/auth-profiles.json`
+4. `~/.openclaw/agents/main/agent/auth-profiles.json`
+5. `~/.openclaw/credentials/oauth.json`
+6. `CODEX_HOME/auth.json`
+7. `~/.codex/auth.json`
 
-Set one of these when auto-detection is not enough:
+For OpenClaw, the current auth store is usually:
 
-```bash
-CODEX_IMAGEN_CODEX_BIN=/path/to/codex
-CODEX_APP_SERVER_BIN=/path/to/codex
-CODEX_BIN=/path/to/codex
+```text
+~/.openclaw/agents/main/agent/auth-profiles.json
 ```
 
-You can also pass `--codex-bin /path/to/codex`.
+Codex CLI is not required at runtime. The skill works with OAuth created by OpenClaw itself, for example `openclaw onboard --auth-choice openai-codex` or `openclaw models auth login --provider openai-codex`. It only needs an existing `openai-codex` OAuth profile; it does not perform the first browser login itself.
+
+`auth-state.json` beside it is used only to prefer OpenClaw's `lastGood.openai-codex` profile. Pass `--auth-profile openai-codex:<id>` when a specific OpenClaw profile should be used.
 
 ## Output Paths
 
-Use `--out-dir` when the caller needs a specific artifact directory:
+Use `--out-dir` or `-o/--output` when the caller needs a specific artifact location:
 
 ```bash
-node {baseDir}/scripts/codex-imagen.mjs --out-dir /tmp/openclaw-images --prompt "generate two UI icon variants"
+node {baseDir}/scripts/codex-imagen.mjs --out-dir ./openclaw-images --prompt 'generate three UI icon variants'
+node {baseDir}/scripts/codex-imagen.mjs -o out/ --prompt 'generate 3 images of a monk mage'
 ```
 
 When `--out-dir` is not set, the script chooses the first available location:
@@ -78,32 +75,37 @@ When `--out-dir` is not set, the script chooses the first available location:
 4. `OPENCLAW_STATE_DIR/artifacts/codex-imagen`
 5. `./codex-imagen-output`
 
-Normal runs write image files only. They do not write `codex-imagen.jsonl`.
+If a run times out after partial results, already-received images remain saved and are printed.
 
-Use `--debug` only when you need the redacted app-server JSON-RPC trace:
+## Reference Images
 
-```bash
-node {baseDir}/scripts/codex-imagen.mjs --debug "generate a small icon"
-```
-
-`--debug` writes `<out-dir>/codex-imagen.jsonl` and progress diagnostics to stderr. Use `--log /path/to/file.jsonl` or `CODEX_IMAGEN_LOG` when you need a specific trace path.
-
-## Multiple Images
-
-Ask for the count in the prompt. The CLI does not need an `--expect-images` flag; it saves every `imageGeneration` item that arrives before the turn completes or times out.
+Attach reference images explicitly. Do not use positional image paths; positional arguments are reserved for prompt text.
 
 ```bash
-node {baseDir}/scripts/codex-imagen.mjs --timeout-ms 900000 --prompt 'can generate 3 images follow this prompt, no refine? "three distinct ancient ARPG MMO screenshots"'
+node {baseDir}/scripts/codex-imagen.mjs --input-ref ref1.png --input-ref ref2.jpg --prompt 'generate 3 images of him livestreaming in this world'
+node {baseDir}/scripts/codex-imagen.mjs -i ref1.png -i ref2.jpg --prompt 'change the main character into a woman'
 ```
 
-If the turn times out after partial results, the command still prints the images it saved. Exit code `4` means timed out with at least one image; exit code `124` means timed out with no images.
+Local images are converted to `data:image/...;base64,...` and sent as `input_image` items. `--input-ref` accepts local paths, `http(s)` URLs, and `data:image/...` URLs. Supported local formats are PNG, JPEG, GIF, and WebP. Use smaller JPEG references when high-fidelity pixel detail is not needed.
 
-## Prompt Notes
+## OAuth Refresh
 
-The underlying image tool may return a `revisedPrompt`; that is normal behavior. To keep the prompt closer to the original wording, ask directly:
+The CLI refreshes expired or near-expiry OAuth tokens through `https://auth.openai.com/oauth/token` and writes the updated token back to the same auth file. Use these controls when needed:
 
-```text
-can generate image follow this prompt, no refine? "<exact prompt>"
+```bash
+node {baseDir}/scripts/codex-imagen.mjs --refresh-only --json
+node {baseDir}/scripts/codex-imagen.mjs --force-refresh --smoke --json
+node {baseDir}/scripts/codex-imagen.mjs --no-refresh --prompt 'generate one image'
 ```
 
-For long prompts or Windows shell quoting, write the prompt to a UTF-8 file and use `--prompt-file`.
+For concurrent OpenClaw processes, prefer the active OpenClaw agent's `auth-profiles.json` so every caller uses the same profile identity. A future OpenClaw-native wrapper can reuse OpenClaw's lock manager for refresh contention; this standalone helper uses atomic writes only.
+
+## Cross-Platform Notes
+
+The helper is plain Node.js 18+ with no native dependencies. It uses `os.homedir()` and environment overrides for Windows, Linux, and macOS. In `cmd.exe`, single quotes are not shell quotes; use double quotes or write UTF-8 text to a file and use:
+
+```bash
+node {baseDir}/scripts/codex-imagen.mjs --prompt-file prompt.txt
+```
+
+Use `--cwd <path>` when another agent launches this script from an unpredictable working directory.

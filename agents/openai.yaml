@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Imagen"
+  short_description: "Generate images with Codex OAuth"
+  default_prompt: "Use $codex-imagen to generate an image with local Codex or OpenClaw OAuth and return the saved file path."
