@@ -14,6 +14,11 @@ const PACKAGE_VERSION = "0.2.2";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_REFRESH_SKEW_SECONDS = 60;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_OPENCLAW_TIMEOUT_MS = 5 * 60 * 1000;
+const FORCE_EXIT_AFTER_ABORT_MS = 10_000;
+const DEFAULT_RETRIES = 4;
+const MAX_RETRIES = 100;
+const RETRY_BASE_DELAY_MS = 200;
 const DEFAULT_IMAGE_DETAIL = "high";
 const LARGE_DATA_URL_WARNING_BYTES = 15 * 1024 * 1024;
 const FILE_LOCK_TIMEOUT_ERROR_CODE = "file_lock_timeout";
@@ -46,6 +51,22 @@ class UsageError extends Error {
   }
 }
 
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "TimeoutError";
+  }
+}
+
+class GenerationFailedError extends Error {
+  constructor(message, { backendErrors = [], seenEventTypes = [] } = {}) {
+    super(message);
+    this.name = "GenerationFailedError";
+    this.backendErrors = backendErrors;
+    this.seenEventTypes = seenEventTypes;
+  }
+}
+
 function usage() {
   return `Usage:
   codex-imagen "prompt" [options]
@@ -75,7 +96,12 @@ Options:
   --force-refresh       Refresh Codex OAuth before generating.
   --refresh-only        Refresh Codex OAuth and exit. Does not require a prompt.
   --no-refresh          Disable proactive refresh and 401 refresh retry.
-  --timeout-ms <ms>     Abort after this many ms. Default: ${DEFAULT_TIMEOUT_MS}. Use 0 to disable.
+  --retries <count>     Retry transient empty failures this many times. Default: ${DEFAULT_RETRIES}.
+  --no-retry            Disable transient generation retries.
+  --timeout <seconds>   Abort after this many seconds. Default: ${DEFAULT_TIMEOUT_MS / 1000};
+                        ${DEFAULT_OPENCLAW_TIMEOUT_MS / 1000} when OpenClaw runtime is detected.
+  --timeout-seconds <s> Alias for --timeout.
+  --timeout-ms <ms>     Advanced: abort after this many milliseconds. Must be greater than 0.
   --no-stream           Request a non-streaming response.
   --json                Print a JSON summary instead of only the image path.
   --quiet               Do not print progress diagnostics to stderr.
@@ -118,9 +144,12 @@ function parseArgs(argv) {
     refreshOnly: false,
     refreshSkewSeconds: DEFAULT_REFRESH_SKEW_SECONDS,
     refreshUrl: process.env.CODEX_REFRESH_TOKEN_URL_OVERRIDE || DEFAULT_REFRESH_URL,
+    retries: DEFAULT_RETRIES,
     smoke: false,
     stream: true,
-    timeoutMs: DEFAULT_TIMEOUT_MS,
+    timeoutMs: null,
+    timeoutMsExplicit: false,
+    timeoutFlag: null,
     verbose: false,
   };
 
@@ -216,18 +245,24 @@ function parseArgs(argv) {
       options.refreshOnly = true;
     } else if (arg === "--no-refresh") {
       options.refresh = false;
+    } else if (longValue("--retries") !== null) {
+      options.retries = parseRetries(longValue("--retries"));
+    } else if (arg === "--retries") {
+      options.retries = parseRetries(next());
+    } else if (arg === "--no-retry") {
+      options.retries = 0;
+    } else if (longValue("--timeout") !== null) {
+      setTimeoutOption(options, longValue("--timeout"), "seconds", "--timeout");
+    } else if (arg === "--timeout") {
+      setTimeoutOption(options, next(), "seconds", "--timeout");
+    } else if (longValue("--timeout-seconds") !== null) {
+      setTimeoutOption(options, longValue("--timeout-seconds"), "seconds", "--timeout-seconds");
+    } else if (arg === "--timeout-seconds") {
+      setTimeoutOption(options, next(), "seconds", "--timeout-seconds");
     } else if (longValue("--timeout-ms") !== null) {
-      const value = Number(longValue("--timeout-ms"));
-      if (!Number.isFinite(value) || value < 0) {
-        throw new UsageError("--timeout-ms must be a non-negative number");
-      }
-      options.timeoutMs = value;
+      setTimeoutOption(options, longValue("--timeout-ms"), "milliseconds", "--timeout-ms");
     } else if (arg === "--timeout-ms") {
-      const value = Number(next());
-      if (!Number.isFinite(value) || value < 0) {
-        throw new UsageError("--timeout-ms must be a non-negative number");
-      }
-      options.timeoutMs = value;
+      setTimeoutOption(options, next(), "milliseconds", "--timeout-ms");
     } else if (arg === "--no-stream") {
       options.stream = false;
     } else if (arg === "--json") {
@@ -254,6 +289,84 @@ function parseArgs(argv) {
   }
 
   return options;
+}
+
+function setTimeoutOption(options, value, unit, flag) {
+  if (options.timeoutMsExplicit) {
+    throw new UsageError(
+      `Use only one timeout option. ${options.timeoutFlag} was already provided; remove ${flag}.`
+    );
+  }
+
+  options.timeoutMs =
+    unit === "seconds" ? parseTimeoutSeconds(value, flag) : parseTimeoutMs(value, flag);
+  options.timeoutMsExplicit = true;
+  options.timeoutFlag = flag;
+}
+
+function parseRetries(value) {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > MAX_RETRIES) {
+    throw new UsageError(`--retries must be an integer from 0 to ${MAX_RETRIES}`);
+  }
+  return parsed;
+}
+
+function parseTimeoutSeconds(value, flag = "--timeout") {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new UsageError(`${flag} must be greater than 0 seconds so generation cannot run unbounded`);
+  }
+  return Math.ceil(parsed * 1000);
+}
+
+function parseTimeoutMs(value, flag = "--timeout-ms") {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new UsageError(`${flag} must be greater than 0 milliseconds so generation cannot run unbounded`);
+  }
+  return Math.ceil(parsed);
+}
+
+function timeoutSeconds(timeoutMs) {
+  return Number((timeoutMs / 1000).toFixed(3));
+}
+
+function describeTimeout(timeoutMs) {
+  return `${timeoutSeconds(timeoutMs)}s (${timeoutMs}ms)`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelayMs(retryNumber) {
+  const exp = 2 ** Math.max(0, retryNumber - 1);
+  const jitter = 0.9 + Math.random() * 0.2;
+  return Math.max(0, Math.round(RETRY_BASE_DELAY_MS * exp * jitter));
+}
+
+function formatDelay(ms) {
+  return `${Number((ms / 1000).toFixed(3))}s`;
+}
+
+function pathLooksInsideOpenClaw(pathname) {
+  const normalized = path.resolve(pathname).split(path.sep);
+  return normalized.includes(".openclaw") || normalized.includes(".clawdbot");
+}
+
+function isOpenClawRuntime() {
+  return Boolean(
+    process.env.OPENCLAW_AGENT_DIR?.trim() ||
+      process.env.PI_CODING_AGENT_DIR?.trim() ||
+      process.env.OPENCLAW_STATE_DIR?.trim() ||
+      process.env.OPENCLAW_OUTPUT_DIR?.trim() ||
+      pathLooksInsideOpenClaw(process.cwd())
+  );
+}
+
+function defaultTimeoutMs() {
+  return isOpenClawRuntime() ? DEFAULT_OPENCLAW_TIMEOUT_MS : DEFAULT_TIMEOUT_MS;
 }
 
 function resolveUserPath(input) {
@@ -400,6 +513,10 @@ function defaultOutputDir() {
 function normalizeOptions(options) {
   if (options.cwd) {
     process.chdir(resolvePathFromCwd(options.cwd));
+  }
+
+  if (!options.timeoutMsExplicit) {
+    options.timeoutMs = defaultTimeoutMs();
   }
 
   options.outDir = options.outDir ? resolvePathFromCwd(options.outDir) : defaultOutputDir();
@@ -667,6 +784,14 @@ function scoreOpenClawProfile(profileId, profile, state) {
   return score;
 }
 
+function isOpenClawCodexOAuthProfile(profile) {
+  return profile?.type === "oauth" && profile.provider === "openai-codex";
+}
+
+function isUsableOpenClawCodexOAuthProfile(profile) {
+  return isOpenClawCodexOAuthProfile(profile) && Boolean(profileAccess(profile)) && Boolean(profileAccountId(profile));
+}
+
 function selectOpenClawProfile(store, authPath, options = {}) {
   const profiles = store.profiles ?? {};
   const requested = options.authProfile?.trim();
@@ -680,14 +805,16 @@ function selectOpenClawProfile(store, authPath, options = {}) {
 
   const state = readSiblingAuthState(authPath);
   const lastGood = state?.lastGood?.["openai-codex"];
-  if (lastGood && profiles[lastGood]?.type === "oauth" && profiles[lastGood]?.provider === "openai-codex") {
+  if (lastGood && isUsableOpenClawCodexOAuthProfile(profiles[lastGood])) {
     return { profileId: lastGood, profile: profiles[lastGood] };
   }
 
   const candidates = Object.entries(profiles).filter(
-    ([, profile]) => profile?.type === "oauth" && profile.provider === "openai-codex"
+    ([, profile]) => isOpenClawCodexOAuthProfile(profile) && profileAccess(profile)
   );
-  candidates.sort(
+  const usableCandidates = candidates.filter(([, profile]) => profileAccountId(profile));
+  const rankedCandidates = usableCandidates.length > 0 ? usableCandidates : candidates;
+  rankedCandidates.sort(
     ([leftId, leftProfile], [rightId, rightProfile]) =>
       scoreOpenClawProfile(rightId, rightProfile, state) -
       scoreOpenClawProfile(leftId, leftProfile, state)
@@ -697,7 +824,7 @@ function selectOpenClawProfile(store, authPath, options = {}) {
     throw new Error(`No openai-codex OAuth profile found in ${authPath}`);
   }
 
-  const [profileId, profile] = candidates[0];
+  const [profileId, profile] = rankedCandidates[0];
   return { profileId, profile };
 }
 
@@ -1430,6 +1557,176 @@ function eventTypeFromPayload(payload) {
   return payload.type ?? payload.event ?? payload.item?.type ?? "object";
 }
 
+function compactJson(value, maxLength = 1200) {
+  let text;
+  try {
+    text = JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, maxLength)}...`;
+}
+
+function normalizeBackendError(source, value) {
+  if (!value) {
+    return null;
+  }
+
+  if (typeof value === "string") {
+    return { source, message: value };
+  }
+
+  if (typeof value !== "object") {
+    return { source, message: String(value) };
+  }
+
+  const message =
+    value.message ??
+    value.error_description ??
+    value.reason ??
+    value.detail ??
+    value.code ??
+    value.status ??
+    null;
+
+  return {
+    source,
+    code: value.code ?? null,
+    type: value.type ?? null,
+    status: value.status ?? null,
+    param: value.param ?? null,
+    message: message ? String(message) : compactJson(value),
+  };
+}
+
+function backendErrorRetryReason(error) {
+  const text = [error.code, error.type, error.status, error.message].filter(Boolean).join(" ").toLowerCase();
+  if (
+    /\b(server_error|internal_error|server_overloaded|service_unavailable|temporarily_unavailable|backend_error)\b/.test(
+      text
+    ) ||
+    text.includes("overloaded") ||
+    text.includes("unavailable")
+  ) {
+    return error.code || error.type || error.status || "backend_error";
+  }
+  return null;
+}
+
+function retryReason(error) {
+  if (error instanceof TimeoutError || error instanceof UsageError) {
+    return null;
+  }
+
+  if (error instanceof HttpStatusError) {
+    if (error.status >= 500 && error.status < 600) {
+      return `HTTP ${error.status}`;
+    }
+    return null;
+  }
+
+  if (error instanceof GenerationFailedError) {
+    for (const backendError of dedupeBackendErrors(error.backendErrors ?? [])) {
+      const reason = backendErrorRetryReason(backendError);
+      if (reason) {
+        return reason;
+      }
+    }
+
+    const seen = new Set(error.seenEventTypes ?? []);
+    if (seen.has("response.failed")) {
+      return "response.failed";
+    }
+    if (error.seenEventTypes?.some((eventType) => eventType.startsWith("unparsed:"))) {
+      return "unparsed_stream_event";
+    }
+    if (error.seenEventTypes?.length === 0) {
+      return "empty_response_stream";
+    }
+    if (
+      !seen.has("response.completed") &&
+      (seen.has("response.created") ||
+        seen.has("response.in_progress") ||
+        seen.has("response.output_item.added") ||
+        seen.has("response.image_generation_call.in_progress") ||
+        seen.has("response.image_generation_call.generating") ||
+        seen.has("keepalive"))
+    ) {
+      return "stream_ended_before_completed_image";
+    }
+
+    return null;
+  }
+
+  const text = `${error?.name ?? ""} ${error?.message ?? ""} ${error?.cause?.code ?? ""} ${
+    error?.cause?.message ?? ""
+  }`;
+  if (/\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR|network|fetch failed)\b/i.test(text)) {
+    return "transport";
+  }
+
+  return null;
+}
+
+function backendErrorsFromPayload(payload, payloadType) {
+  const errors = [];
+  const add = (source, value) => {
+    const normalized = normalizeBackendError(source, value);
+    if (normalized) {
+      errors.push(normalized);
+    }
+  };
+
+  if (payloadType === "error" || payload?.error) {
+    add("error", payload?.error ?? payload);
+  }
+
+  if (payloadType === "response.failed" || payload?.response?.status === "failed") {
+    add("response.error", payload?.response?.error);
+    add("response.incomplete_details", payload?.response?.incomplete_details);
+    if (!payload?.response?.error && !payload?.response?.incomplete_details) {
+      add("response.failed", {
+        status: payload?.response?.status,
+        id: payload?.response?.id,
+      });
+    }
+  }
+
+  add("item.error", payload?.item?.error);
+
+  return errors;
+}
+
+function formatBackendError(error) {
+  const parts = [error.source];
+  if (error.status) parts.push(`status=${error.status}`);
+  if (error.code) parts.push(`code=${error.code}`);
+  if (error.type) parts.push(`type=${error.type}`);
+  if (error.param) parts.push(`param=${error.param}`);
+  parts.push(error.message);
+  return parts.filter(Boolean).join(" ");
+}
+
+function dedupeBackendErrors(errors) {
+  const seen = new Set();
+  return errors.filter((error) => {
+    const key = [error.code, error.param, error.message].join("\u0000");
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function formatBackendErrors(errors) {
+  return dedupeBackendErrors(errors).map((error) => `  - ${formatBackendError(error)}`).join("\n");
+}
+
 async function parseStreamingResponse(response, options, onImageCall, streamState = {}) {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -1437,6 +1734,7 @@ async function parseStreamingResponse(response, options, onImageCall, streamStat
   const seenEventTypes = streamState.seenEventTypes ?? new Set();
   streamState.seenEventTypes = seenEventTypes;
   const progressEvents = new Set();
+  const backendErrors = [];
 
   const noteProgress = (payloadType) => {
     if (progressEvents.has(payloadType)) {
@@ -1496,6 +1794,7 @@ async function parseStreamingResponse(response, options, onImageCall, streamStat
       seenEventTypes.add(payloadType);
       logVerbose(options, `event: ${payloadType}`);
       noteProgress(payloadType);
+      backendErrors.push(...backendErrorsFromPayload(payload, payloadType));
 
       for (const call of imageCallsFromPayload(payload, payloadType)) {
         await recordImageCall(call);
@@ -1517,6 +1816,7 @@ async function parseStreamingResponse(response, options, onImageCall, streamStat
         seenEventTypes.add(payloadType);
         logVerbose(options, `event: ${payloadType}`);
         noteProgress(payloadType);
+        backendErrors.push(...backendErrorsFromPayload(payload, payloadType));
         for (const call of imageCallsFromPayload(payload, payloadType)) {
           await recordImageCall(call);
         }
@@ -1529,6 +1829,7 @@ async function parseStreamingResponse(response, options, onImageCall, streamStat
   return {
     imageCalls: [...imageCalls.values()],
     seenEventTypes: [...seenEventTypes],
+    backendErrors,
   };
 }
 
@@ -1538,6 +1839,7 @@ async function parseJsonResponse(response) {
   return {
     imageCalls: imageCallsFromPayload(payload, payloadType),
     seenEventTypes: [payloadType],
+    backendErrors: backendErrorsFromPayload(payload, payloadType),
   };
 }
 
@@ -1687,6 +1989,30 @@ function buildResult({ requestId, sessionId, endpoint, model, images, seenEventT
   };
 }
 
+function createGenerationWatchdog(options, abortController) {
+  let forceExit = null;
+  const timeout = setTimeout(() => {
+    abortController.abort();
+    forceExit = setTimeout(() => {
+      console.error(
+        `codex-imagen: forced exit ${FORCE_EXIT_AFTER_ABORT_MS}ms after timeout; fetch did not settle`
+      );
+      process.exit(124);
+    }, FORCE_EXIT_AFTER_ABORT_MS);
+  }, options.timeoutMs);
+
+  timeout.unref?.();
+
+  return {
+    clear() {
+      clearTimeout(timeout);
+      if (forceExit) {
+        clearTimeout(forceExit);
+      }
+    },
+  };
+}
+
 async function requestImage(options, prompt, auth) {
   const requestId = randomUUID();
   const sessionId = randomUUID();
@@ -1695,9 +2021,7 @@ async function requestImage(options, prompt, auth) {
   const streamState = { seenEventTypes: new Set() };
   const streamingSaver = createStreamingImageSaver(options);
   const abortController = new AbortController();
-  const timeout = options.timeoutMs > 0
-    ? setTimeout(() => abortController.abort(), options.timeoutMs)
-    : null;
+  const watchdog = createGenerationWatchdog(options, abortController);
 
   logProgress(options, `codex-imagen: POST ${endpoint}`);
   logProgress(options, `codex-imagen: model ${options.model}`);
@@ -1726,8 +2050,15 @@ async function requestImage(options, prompt, auth) {
       : await saveImageCallsAtEnd(options, parsed.imageCalls);
 
     if (images.length === 0) {
-      throw new Error(
-        `No completed image_generation_call with result found. Seen event types: ${parsed.seenEventTypes.join(", ") || "(none)"}`
+      const backendErrorText = parsed.backendErrors?.length
+        ? `\nBackend error details:\n${formatBackendErrors(parsed.backendErrors)}`
+        : "";
+      throw new GenerationFailedError(
+        `No completed image_generation_call with result found. Seen event types: ${parsed.seenEventTypes.join(", ") || "(none)"}${backendErrorText}`,
+        {
+          backendErrors: parsed.backendErrors ?? [],
+          seenEventTypes: parsed.seenEventTypes,
+        }
       );
     }
 
@@ -1743,7 +2074,7 @@ async function requestImage(options, prompt, auth) {
     if (abortController.signal.aborted && streamingSaver.images.length > 0) {
       logProgress(
         options,
-        `codex-imagen: timed out after ${options.timeoutMs}ms; returning ${streamingSaver.images.length} saved image(s)`
+        `codex-imagen: timed out after ${describeTimeout(options.timeoutMs)}; returning ${streamingSaver.images.length} saved image(s)`
       );
       return buildResult({
         requestId,
@@ -1757,13 +2088,45 @@ async function requestImage(options, prompt, auth) {
     }
 
     if (abortController.signal.aborted) {
-      throw new Error(`Timed out after ${options.timeoutMs}ms before any image was saved.`);
+      throw new TimeoutError(
+        `Timed out after ${describeTimeout(options.timeoutMs)} before any image was saved.`
+      );
     }
 
     throw error;
   } finally {
-    if (timeout) {
-      clearTimeout(timeout);
+    watchdog.clear();
+  }
+}
+
+async function requestImageWithRetries(options, prompt, auth) {
+  const totalAttempts = options.retries + 1;
+
+  for (let attemptIndex = 0; ; attemptIndex += 1) {
+    if (totalAttempts > 1) {
+      logProgress(options, `codex-imagen: generation attempt ${attemptIndex + 1}/${totalAttempts}`);
+    }
+
+    try {
+      const result = await requestImage(options, prompt, auth);
+      if (attemptIndex > 0) {
+        result.retry_attempts = attemptIndex;
+        result.retryAttempts = attemptIndex;
+      }
+      return result;
+    } catch (error) {
+      const reason = retryReason(error);
+      if (!reason || attemptIndex >= options.retries) {
+        throw error;
+      }
+
+      const retryNumber = attemptIndex + 1;
+      const delayMs = retryDelayMs(retryNumber);
+      logProgress(
+        options,
+        `codex-imagen: transient generation failure (${reason}); retrying ${retryNumber}/${options.retries} in ${formatDelay(delayMs)}`
+      );
+      await sleep(delayMs);
     }
   }
 }
@@ -1802,6 +2165,10 @@ function authSummary(auth, options) {
     endpoint: `${options.baseUrl.replace(/\/+$/, "")}/responses`,
     model: options.model,
     out_dir: options.outDir,
+    retries: options.retries,
+    total_attempts: options.retries + 1,
+    timeout_seconds: timeoutSeconds(options.timeoutMs),
+    timeout_ms: options.timeoutMs,
   };
 }
 
@@ -1879,7 +2246,7 @@ async function main() {
 
   let result;
   try {
-    result = await requestImage(options, prompt, auth);
+    result = await requestImageWithRetries(options, prompt, auth);
   } catch (error) {
     if (!(error instanceof HttpStatusError) || error.status !== 401 || !options.refresh) {
       throw error;
@@ -1887,7 +2254,7 @@ async function main() {
 
     const retryRefresh = await refreshAuth(options, auth, "401 from Codex backend");
     auth = retryRefresh.auth;
-    result = await requestImage(options, prompt, auth);
+    result = await requestImageWithRetries(options, prompt, auth);
     refresh = retryRefresh;
   }
 
@@ -1913,6 +2280,21 @@ main().catch((error) => {
   if (error instanceof UsageError) {
     console.error(`Error: ${error.message}`);
     process.exitCode = 2;
+    return;
+  }
+  if (error instanceof TimeoutError) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 124;
+    return;
+  }
+  if (error instanceof GenerationFailedError) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  if (error instanceof HttpStatusError) {
+    console.error(`Error: ${error.message}`);
+    process.exitCode = 1;
     return;
   }
   console.error(error?.stack || error?.message || String(error));

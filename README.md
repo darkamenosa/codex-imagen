@@ -35,7 +35,7 @@ node scripts/codex-imagen.mjs 'generate image follow this prompt, no refine: "a 
 Generate multiple images by asking for them in the prompt. There is no `--count` flag.
 
 ```bash
-node scripts/codex-imagen.mjs --timeout-ms 900000 'generate 3 images follow this prompt, no refine: "three distinct ancient ARPG MMO screenshots"'
+node scripts/codex-imagen.mjs --timeout 900 'generate 3 images follow this prompt, no refine: "three distinct ancient ARPG MMO screenshots"'
 ```
 
 Normal generation prints one saved PNG path per line. Diagnostics and progress are written to stderr unless `--quiet` is used.
@@ -68,7 +68,11 @@ Output options:
 Runtime options:
 
 - `--model <name>`: model slug. Default: `gpt-5.4`.
-- `--timeout-ms <ms>`: abort after this many milliseconds. Default: `900000`; use `0` to disable.
+- `--retries <count>`: retry transient empty failures this many times. Default: `4`, matching Codex's request retry default of 5 total attempts. Retries apply to network failures, HTTP 5xx, backend `server_error` / overloaded / unavailable responses, and dropped/incomplete streams before any image is saved.
+- `--no-retry`: disable transient generation retries.
+- `--timeout <seconds>`: abort after this many seconds per generation attempt. Default: `900`, or `300` when an OpenClaw runtime is detected; must be greater than `0`. This is the recommended flag for OpenClaw and other agent usage.
+- `--timeout-seconds <seconds>`: alias for `--timeout`.
+- `--timeout-ms <ms>`: advanced compatibility flag for millisecond timeouts and sub-second tests. Use only one timeout flag per command. After timeout, a hard watchdog forces exit code `124` if the HTTP abort does not settle.
 - `--no-stream`: request a non-streaming response. By default streaming mode saves each image as soon as it arrives.
 - `--quiet`: suppress progress diagnostics on stderr.
 - `--verbose` or `--debug`: print request progress and raw event names to stderr.
@@ -175,6 +179,7 @@ Generation JSON includes:
 - `images[].bytes`, `sha256`, `call_id`, `status`, `partial`, `revised_prompt`
 - `seen_event_types`
 - `timed_out`
+- `retry_attempts` and `retryAttempts` when a later retry succeeds
 - `auth_refresh` when refresh happened or was skipped during the run
 
 `--smoke --json` prints redacted auth metadata. `--refresh-only --json` prints refresh metadata.
@@ -192,8 +197,14 @@ codex-imagen/
 OpenClaw callers should usually rely on the active agent auth store and output directory:
 
 ```bash
-node {baseDir}/scripts/codex-imagen.mjs --json --prompt 'generate an image'
+node {baseDir}/scripts/codex-imagen.mjs --json --timeout 300 --prompt 'generate an image'
 ```
+
+`--timeout 300` means 5 minutes and matches OpenClaw's surrounding `exec` tool `timeout` unit. `--timeout-ms 300000` is still accepted for older callers and advanced millisecond use.
+
+For prompts that ask for 3 images, prefer `--timeout 600`, or ask for 2 images when the conversation should return quickly. If a multi-image request times out after saving 1 or 2 images, the helper returns those saved paths with `timed_out: true`.
+
+By default the helper also retries transient empty failures with `--retries 4`, so a caller that sets a strict outer OpenClaw `exec.timeout` should budget for retry time or pass `--no-retry`. The helper never retries after streaming has saved an image; partial images are returned instead of duplicating the generation.
 
 Use `--cwd <path>` when another agent launches this script from an unpredictable working directory.
 
@@ -212,8 +223,9 @@ PowerShell accepts normal quoted strings, but for long prompts `--prompt-file` i
 ## Exit Codes
 
 - `0`: success, including a timeout after at least one streaming image was saved
-- `1`: generation failed, no image returned, HTTP error, or timeout before any image was saved
+- `1`: generation failed, no image returned, or HTTP error
 - `2`: invalid CLI usage
+- `124`: timed out before any image was saved, or the hard watchdog forced exit after abort did not settle
 
 ## Development
 
