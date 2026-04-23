@@ -10,7 +10,7 @@ metadata:
 
 # Codex Imagen
 
-Generate images by calling the ChatGPT/Codex backend directly with OAuth credentials already stored on the machine. This does not start `codex app-server`, does not need the Codex CLI binary, and does not require `OPENAI_API_KEY`.
+Generate or edit images by calling the ChatGPT/Codex backend directly with OAuth credentials already stored on the machine. This calls the native Responses `image_generation` tool, does not start `codex app-server`, does not need the Codex CLI binary, and does not require `OPENAI_API_KEY`.
 
 ## Quick Start
 
@@ -28,6 +28,14 @@ Use `--json` when the caller needs machine-readable metadata:
 node {baseDir}/scripts/codex-imagen.mjs --json --prompt 'generate a small blue lotus icon'
 ```
 
+Ask for multiple outputs in the prompt. There is no `--count` flag:
+
+```bash
+node {baseDir}/scripts/codex-imagen.mjs -o out/ --prompt 'generate 3 images of a monk mage'
+```
+
+Use `--verbose` or `--debug` for event-level progress, and `--quiet` when only stdout paths/JSON should be emitted.
+
 ## Auth Discovery
 
 The CLI reads existing OAuth JSON and sends `Authorization: Bearer <access>` plus `ChatGPT-Account-Id` to `https://chatgpt.com/backend-api/codex/responses`.
@@ -43,10 +51,12 @@ Auth lookup order:
 1. `--auth`
 2. `CODEX_IMAGEN_AUTH_JSON`, `OPENCLAW_CODEX_AUTH_JSON`, `CODEX_AUTH_JSON`
 3. `OPENCLAW_AGENT_DIR/auth-profiles.json` or `PI_CODING_AGENT_DIR/auth-profiles.json`
-4. `~/.openclaw/agents/main/agent/auth-profiles.json`
-5. `~/.openclaw/credentials/oauth.json`
-6. `CODEX_HOME/auth.json`
-7. `~/.codex/auth.json`
+4. `OPENCLAW_AGENT_DIR/auth.json` or `PI_CODING_AGENT_DIR/auth.json`
+5. `~/.openclaw/agents/main/agent/auth-profiles.json`
+6. `~/.openclaw/agents/main/agent/auth.json`
+7. `~/.openclaw/credentials/oauth.json`
+8. `CODEX_HOME/auth.json`
+9. `~/.codex/auth.json`
 
 For OpenClaw, the current auth store is usually:
 
@@ -56,7 +66,7 @@ For OpenClaw, the current auth store is usually:
 
 Codex CLI is not required at runtime. The skill works with OAuth created by OpenClaw itself, for example `openclaw onboard --auth-choice openai-codex` or `openclaw models auth login --provider openai-codex`. It only needs an existing `openai-codex` OAuth profile; it does not perform the first browser login itself.
 
-`auth-state.json` beside it is used only to prefer OpenClaw's `lastGood.openai-codex` profile. Pass `--auth-profile openai-codex:<id>` when a specific OpenClaw profile should be used.
+`auth-state.json` beside it is used only to prefer OpenClaw's `lastGood.openai-codex` profile. Pass `--auth-profile openai-codex:<id>` when a specific OpenClaw profile should be used. The same value can come from `CODEX_IMAGEN_AUTH_PROFILE` or `OPENCLAW_AUTH_PROFILE`.
 
 ## Output Paths
 
@@ -67,6 +77,8 @@ node {baseDir}/scripts/codex-imagen.mjs --out-dir ./openclaw-images --prompt 'ge
 node {baseDir}/scripts/codex-imagen.mjs -o out/ --prompt 'generate 3 images of a monk mage'
 ```
 
+`--output image.png` writes exactly that path for one image. If multiple images arrive, outputs are numbered as `image-1.png`, `image-2.png`, and so on. If `--output` has no extension or ends in `/`, it is treated as a directory. Without `--output`, automatic names use `codex-imagen-<timestamp>-<optional-index>-<image-call-id>.png`.
+
 When `--out-dir` is not set, the script chooses the first available location:
 
 1. `CODEX_IMAGEN_OUT_DIR`
@@ -75,7 +87,7 @@ When `--out-dir` is not set, the script chooses the first available location:
 4. `OPENCLAW_STATE_DIR/artifacts/codex-imagen`
 5. `./codex-imagen-output`
 
-If a run times out after partial results, already-received images remain saved and are printed.
+Streaming is enabled by default and saves each image as soon as it arrives. If a run times out after partial results, already received images remain saved and are printed. Use `--timeout-ms 0` to disable the timeout or `--no-stream` to request a non-streaming response.
 
 ## Reference Images
 
@@ -84,9 +96,10 @@ Attach reference images explicitly. Do not use positional image paths; positiona
 ```bash
 node {baseDir}/scripts/codex-imagen.mjs --input-ref ref1.png --input-ref ref2.jpg --prompt 'generate 3 images of him livestreaming in this world'
 node {baseDir}/scripts/codex-imagen.mjs -i ref1.png -i ref2.jpg --prompt 'change the main character into a woman'
+node {baseDir}/scripts/codex-imagen.mjs --image-url 'https://example.com/ref.png' --prompt 'use this image as the world reference'
 ```
 
-Local images are converted to `data:image/...;base64,...` and sent as `input_image` items. `--input-ref` accepts local paths, `http(s)` URLs, and `data:image/...` URLs. Supported local formats are PNG, JPEG, GIF, and WebP. Use smaller JPEG references when high-fidelity pixel detail is not needed.
+Local images are converted to `data:image/...;base64,...` and sent as `input_image` items. `--input-ref` accepts local paths, `http(s)` URLs, and `data:image/...` URLs. `-i/--image` is local-only, and `--image-url` is URL/data-URL only. Supported local formats are PNG, JPEG, GIF, and WebP. Use `--image-detail auto|low|high|original` when the model should receive lower or higher image detail; default is `high`. Use smaller JPEG references when high-fidelity pixel detail is not needed.
 
 ## OAuth Refresh
 
@@ -101,6 +114,8 @@ node {baseDir}/scripts/codex-imagen.mjs --no-refresh --prompt 'generate one imag
 ```
 
 For concurrent OpenClaw processes, prefer the active OpenClaw agent's `auth-profiles.json` so every caller uses the same profile identity. Use `--no-refresh` only when the caller already owns OAuth refresh and wants this helper to use the provided access token as-is.
+
+Use `--base-url` only for a compatible Codex backend, and `--refresh-url` only for a compatible OAuth refresh endpoint.
 
 ## Cross-Platform Notes
 

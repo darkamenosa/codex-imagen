@@ -66,7 +66,7 @@ Options:
   --out-dir <path>      Output directory when --output is not provided.
   --model <name>        Model slug. Default: ${DEFAULT_MODEL}
   --auth <path>         Auth JSON path. Supports Codex auth.json, OpenClaw auth-profiles.json,
-                        OpenClaw legacy auth.json, and OpenClaw credentials/oauth.json.
+                        OpenClaw agent/legacy auth.json, and OpenClaw credentials/oauth.json.
   --auth-profile <id>   OpenClaw auth profile id. Default: auth-state lastGood, then best openai-codex OAuth profile.
   --base-url <url>      Codex backend base URL. Default: ${DEFAULT_BASE_URL}
   --refresh-url <url>   OAuth refresh endpoint. Default: ${DEFAULT_REFRESH_URL}
@@ -88,10 +88,12 @@ Auth discovery order:
   1. --auth
   2. CODEX_IMAGEN_AUTH_JSON, OPENCLAW_CODEX_AUTH_JSON, CODEX_AUTH_JSON
   3. OPENCLAW_AGENT_DIR/auth-profiles.json or PI_CODING_AGENT_DIR/auth-profiles.json
-  4. ~/.openclaw/agents/main/agent/auth-profiles.json
-  5. ~/.openclaw/credentials/oauth.json
-  6. CODEX_HOME/auth.json
-  7. ~/.codex/auth.json
+  4. OPENCLAW_AGENT_DIR/auth.json or PI_CODING_AGENT_DIR/auth.json
+  5. ~/.openclaw/agents/main/agent/auth-profiles.json
+  6. ~/.openclaw/agents/main/agent/auth.json
+  7. ~/.openclaw/credentials/oauth.json
+  8. CODEX_HOME/auth.json
+  9. ~/.codex/auth.json
 `;
 }
 

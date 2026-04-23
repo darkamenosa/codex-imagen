@@ -2,6 +2,13 @@
 
 All notable changes to `codex-imagen` are recorded here.
 
+## Unreleased
+
+### Changed
+
+- Expanded README and skill instructions to document the current CLI flags, auth lookup behavior, reference image modes, output naming, streaming, timeout, JSON, and diagnostics behavior.
+- Updated skill UI metadata to describe image editing and multi-output paths.
+
 ## [0.2.2] - 2026-04-23
 
 ### Added
