@@ -4,6 +4,8 @@ All notable changes to `codex-imagen` are recorded here.
 
 ## Unreleased
 
+## [0.2.3] - 2026-04-23
+
 ### Changed
 
 - Added seconds-based `--timeout` and `--timeout-seconds` flags for OpenClaw-aligned agent usage, while keeping `--timeout-ms` for compatibility and fine-grained tests.
