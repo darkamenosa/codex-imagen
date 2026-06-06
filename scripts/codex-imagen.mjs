@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import fsSync, { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,10 +8,16 @@ import process from "node:process";
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
-const DEFAULT_MODEL = "gpt-5.4";
+const DEFAULT_BACKEND = "responses";
+const DEFAULT_RESPONSES_MODEL = "gpt-5.4";
+const DEFAULT_IMAGES_MODEL = "gpt-image-2";
+const DEFAULT_IMAGE_BACKGROUND = "auto";
+const DEFAULT_IMAGE_QUALITY = "auto";
+const DEFAULT_IMAGE_SIZE = "auto";
 const DEFAULT_OPENCLAW_AGENT_ID = "main";
 const DEFAULT_CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
-const PACKAGE_VERSION = "0.2.6";
+const PACKAGE_VERSION = "0.2.7";
+const DEFAULT_CODEX_USER_AGENT_VERSION = "0.137.0";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_REFRESH_SKEW_SECONDS = 5 * 60;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -43,6 +50,7 @@ const OAUTH_REFRESH_LOCK_OPTIONS = {
   stale: 180_000,
 };
 const OAUTH_REFRESH_CALL_TIMEOUT_MS = 120_000;
+const CHATGPT_CLOUDFLARE_COOKIES = new Map();
 
 class UsageError extends Error {
   constructor(message) {
@@ -58,6 +66,13 @@ class TimeoutError extends Error {
   }
 }
 
+class StreamError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "StreamError";
+  }
+}
+
 class GenerationFailedError extends Error {
   constructor(message, { backendErrors = [], seenEventTypes = [] } = {}) {
     super(message);
@@ -65,6 +80,18 @@ class GenerationFailedError extends Error {
     this.backendErrors = backendErrors;
     this.seenEventTypes = seenEventTypes;
   }
+}
+
+function transportErrorText(error) {
+  return `${error?.name ?? ""} ${error?.message ?? ""} ${error?.cause?.code ?? ""} ${
+    error?.cause?.message ?? ""
+  }`;
+}
+
+function isTransportError(error) {
+  return /\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR|network|fetch failed|terminated)\b/i.test(
+    transportErrorText(error)
+  );
 }
 
 function usage() {
@@ -80,12 +107,16 @@ Options:
                         Attach a reference image from a local path, http(s) URL, or data:image URL.
                         Repeat or comma-separate.
   --image-url <url>     Attach an image URL or data:image/... URL as a reference.
-  --image-detail <mode> input_image detail: high, low, auto, original. Default: ${DEFAULT_IMAGE_DETAIL}
+  --image-detail <mode> Responses input_image detail: auto, low, high, original.
+                        Ignored by --backend images. Default: ${DEFAULT_IMAGE_DETAIL}
   -o, --output <path>   Output PNG path.
                         If multiple images arrive, saves name-1.png, name-2.png, ...
                         If this has no extension or ends in /, treats it as a directory.
   --out-dir <path>      Output directory when --output is not provided.
-  --model <name>        Model slug. Default: ${DEFAULT_MODEL}
+  --backend <name>      Codex image backend: responses or images. Default: ${DEFAULT_BACKEND}.
+                        responses matches current Codex hosted image_generation.
+                        images uses the under-development standalone endpoint.
+  --model <name>        Model slug. Defaults: responses=${DEFAULT_RESPONSES_MODEL}, images=${DEFAULT_IMAGES_MODEL}
   --auth <path>         Auth JSON path. Supports Codex auth.json, OpenClaw auth-profiles.json,
                         OpenClaw agent/legacy auth.json, and OpenClaw credentials/oauth.json.
   --auth-profile <id>   OpenClaw auth profile id. Default: OpenClaw config/order,
@@ -103,10 +134,10 @@ Options:
                         ${DEFAULT_OPENCLAW_TIMEOUT_MS / 1000} when OpenClaw runtime is detected.
   --timeout-seconds <s> Alias for --timeout.
   --timeout-ms <ms>     Advanced: abort after this many milliseconds. Must be greater than 0.
-  --no-stream           Request a non-streaming response.
+  --no-stream           Request a non-streaming Responses response. Images backend is always JSON.
   --json                Print a JSON summary instead of only the image path.
   --quiet               Do not print progress diagnostics to stderr.
-  --verbose             Print request progress and raw event names to stderr.
+  --verbose             Print request progress, raw Responses event names, and reference image details.
   --debug               Alias for --verbose.
   --version             Print version.
   -h, --help            Show this help.
@@ -129,6 +160,7 @@ function parseArgs(argv) {
     authPath: null,
     authProfile: process.env.CODEX_IMAGEN_AUTH_PROFILE || process.env.OPENCLAW_AUTH_PROFILE || null,
     baseUrl: DEFAULT_BASE_URL,
+    backend: process.env.CODEX_IMAGEN_BACKEND || DEFAULT_BACKEND,
     cwd: null,
     forceRefresh: false,
     imageDetail: DEFAULT_IMAGE_DETAIL,
@@ -137,7 +169,7 @@ function parseArgs(argv) {
     authPathCandidates: [],
     authPathExplicit: false,
     json: false,
-    model: DEFAULT_MODEL,
+    model: null,
     outDir: null,
     output: null,
     prompt: null,
@@ -216,6 +248,14 @@ function parseArgs(argv) {
       options.outDir = longValue("--out-dir");
     } else if (arg === "--out-dir") {
       options.outDir = next();
+    } else if (longValue("--backend") !== null) {
+      options.backend = longValue("--backend");
+    } else if (arg === "--backend") {
+      options.backend = next();
+    } else if (longValue("--image-backend") !== null) {
+      options.backend = longValue("--image-backend");
+    } else if (arg === "--image-backend") {
+      options.backend = next();
     } else if (longValue("--model") !== null) {
       options.model = longValue("--model");
     } else if (arg === "--model") {
@@ -534,6 +574,14 @@ function defaultOutputDir() {
 function normalizeOptions(options) {
   if (options.cwd) {
     process.chdir(resolvePathFromCwd(options.cwd));
+  }
+
+  if (!["responses", "images"].includes(options.backend)) {
+    throw new UsageError("--backend must be one of: responses, images");
+  }
+
+  if (!options.model) {
+    options.model = options.backend === "images" ? DEFAULT_IMAGES_MODEL : DEFAULT_RESPONSES_MODEL;
   }
 
   if (!options.timeoutMsExplicit) {
@@ -1154,7 +1202,7 @@ function urlToInputImage(imageUrl, options) {
   };
 }
 
-async function buildPromptContent(options, prompt) {
+async function buildInputImages(options) {
   const refs = [];
 
   for (const imagePath of options.imagePaths) {
@@ -1164,18 +1212,6 @@ async function buildPromptContent(options, prompt) {
   for (const imageUrl of options.imageUrls) {
     refs.push(urlToInputImage(imageUrl, options));
   }
-
-  const content = [];
-  refs.forEach((ref, index) => {
-    content.push({ type: "input_text", text: localImageOpenTagText(index) });
-    content.push({
-      type: "input_image",
-      image_url: ref.image_url,
-      detail: options.imageDetail,
-    });
-    content.push({ type: "input_text", text: imageCloseTagText() });
-  });
-  content.push({ type: "input_text", text: prompt });
 
   if (refs.length > 0) {
     logProgress(options, `codex-imagen: attached ${refs.length} reference image(s)`);
@@ -1187,7 +1223,55 @@ async function buildPromptContent(options, prompt) {
     });
   }
 
+  return refs;
+}
+
+async function buildPromptContent(options, prompt) {
+  const refs = await buildInputImages(options);
+  const content = [];
+
+  refs.forEach((ref, index) => {
+    content.push({ type: "input_text", text: localImageOpenTagText(index) });
+    content.push({
+      type: "input_image",
+      image_url: ref.image_url,
+      detail: options.imageDetail,
+    });
+    content.push({ type: "input_text", text: imageCloseTagText() });
+  });
+  content.push({ type: "input_text", text: prompt });
+
   return content;
+}
+
+async function buildImageRequest(options, prompt) {
+  const refs = await buildInputImages(options);
+  const body = {
+    prompt,
+    background: DEFAULT_IMAGE_BACKGROUND,
+    model: options.model,
+    quality: DEFAULT_IMAGE_QUALITY,
+    size: DEFAULT_IMAGE_SIZE,
+  };
+
+  if (refs.length === 0) {
+    return {
+      path: "images/generations",
+      operation: "image generation",
+      body,
+      refCount: 0,
+    };
+  }
+
+  return {
+    path: "images/edits",
+    operation: "image edit",
+    body: {
+      images: refs.map((ref) => ({ image_url: ref.image_url })),
+      ...body,
+    },
+    refCount: refs.length,
+  };
 }
 
 async function buildResponsesBody(options, prompt, requestId) {
@@ -1217,18 +1301,232 @@ async function buildResponsesBody(options, prompt, requestId) {
   };
 }
 
-function buildHeaders(auth, requestId, sessionId) {
-  return {
-    "accept": "text/event-stream, application/json",
+function sanitizeUserAgentPart(value, fallback = "unknown") {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return fallback;
+  }
+  return text
+    .split("")
+    .map((ch) => {
+      const code = ch.charCodeAt(0);
+      return code >= 0x20 && code <= 0x7e ? ch : "_";
+    })
+    .join("");
+}
+
+function macOsProductVersion() {
+  try {
+    return execFileSync("sw_vers", ["-productVersion"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1000,
+    }).trim();
+  } catch {
+    return os.release();
+  }
+}
+
+function codexOsInfo() {
+  if (process.platform === "darwin") {
+    return `Mac OS ${macOsProductVersion()}`;
+  }
+  if (process.platform === "win32") {
+    return `Windows ${os.release()}`;
+  }
+  if (process.platform === "linux") {
+    return `Linux ${os.release()}`;
+  }
+  return `${process.platform} ${os.release()}`;
+}
+
+function terminalUserAgent() {
+  const termProgram = process.env.TERM_PROGRAM?.trim();
+  if (termProgram) {
+    const version = process.env.TERM_PROGRAM_VERSION?.trim();
+    return sanitizeUserAgentPart(version ? `${termProgram}/${version}` : termProgram);
+  }
+
+  const term = process.env.TERM?.trim();
+  return sanitizeUserAgentPart(term || "unknown");
+}
+
+function codexUserAgentVersion() {
+  const explicit = process.env.CODEX_IMAGEN_CODEX_VERSION?.trim();
+  if (explicit) {
+    return sanitizeUserAgentPart(explicit, DEFAULT_CODEX_USER_AGENT_VERSION);
+  }
+
+  try {
+    const output = execFileSync("codex", ["--version"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1000,
+    }).trim();
+    const match = output.match(/\b(?:codex-cli|codex)\s+([^\s]+)/i);
+    if (match?.[1]) {
+      return sanitizeUserAgentPart(match[1], DEFAULT_CODEX_USER_AGENT_VERSION);
+    }
+  } catch {
+    // Fall through to the version observed from the local Codex install.
+  }
+
+  return DEFAULT_CODEX_USER_AGENT_VERSION;
+}
+
+function codexUserAgent() {
+  const platform = `${codexOsInfo()}; ${os.arch()}`;
+  return sanitizeUserAgentPart(
+    `codex_cli_rs/${codexUserAgentVersion()} (${platform}) ${terminalUserAgent()}`,
+    "codex_cli_rs"
+  );
+}
+
+function isAllowedChatGptHost(host) {
+  return (
+    host === "chatgpt.com" ||
+    host === "chat.openai.com" ||
+    host === "chatgpt-staging.com" ||
+    host.endsWith(".chatgpt.com") ||
+    host.endsWith(".chatgpt-staging.com")
+  );
+}
+
+function isChatGptCookieUrl(endpoint) {
+  try {
+    const url = new URL(endpoint);
+    return url.protocol === "https:" && isAllowedChatGptHost(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedCloudflareCookieName(name) {
+  return (
+    [
+      "__cf_bm",
+      "__cflb",
+      "__cfruid",
+      "__cfseq",
+      "__cfwaitingroom",
+      "_cfuvid",
+      "cf_clearance",
+      "cf_ob_info",
+      "cf_use_ob",
+    ].includes(name) || name.startsWith("cf_chl_")
+  );
+}
+
+function splitSetCookieHeaders(combinedHeader) {
+  if (!combinedHeader) {
+    return [];
+  }
+
+  const headers = [];
+  let start = 0;
+  let inExpires = false;
+  for (let index = 0; index < combinedHeader.length; index += 1) {
+    const char = combinedHeader[index];
+    if (char === ",") {
+      const rest = combinedHeader.slice(index + 1);
+      if (!inExpires && /^\s*[^=;,\s]+=/.test(rest)) {
+        headers.push(combinedHeader.slice(start, index).trim());
+        start = index + 1;
+      }
+      continue;
+    }
+
+    if (char === ";") {
+      inExpires = false;
+      continue;
+    }
+
+    if (
+      !inExpires &&
+      combinedHeader.slice(index, index + "expires=".length).toLowerCase() === "expires="
+    ) {
+      inExpires = true;
+    }
+  }
+
+  headers.push(combinedHeader.slice(start).trim());
+  return headers.filter(Boolean);
+}
+
+function getSetCookieHeaders(response) {
+  if (typeof response.headers.getSetCookie === "function") {
+    return response.headers.getSetCookie();
+  }
+
+  return splitSetCookieHeaders(response.headers.get("set-cookie"));
+}
+
+function setCookiePair(setCookieHeader) {
+  return setCookieHeader.split(";", 1)[0]?.trim() || null;
+}
+
+function storeCloudflareCookiesFromResponse(response, endpoint) {
+  if (!isChatGptCookieUrl(endpoint)) {
+    return 0;
+  }
+
+  let stored = 0;
+  for (const header of getSetCookieHeaders(response)) {
+    const pair = setCookiePair(header);
+    const name = pair?.split("=", 1)[0]?.trim();
+    if (pair && name && isAllowedCloudflareCookieName(name)) {
+      CHATGPT_CLOUDFLARE_COOKIES.set(name, pair);
+      stored += 1;
+    }
+  }
+
+  return stored;
+}
+
+function cloudflareCookieHeader(endpoint) {
+  if (!isChatGptCookieUrl(endpoint) || CHATGPT_CLOUDFLARE_COOKIES.size === 0) {
+    return null;
+  }
+
+  return Array.from(CHATGPT_CLOUDFLARE_COOKIES.values()).join("; ");
+}
+
+function applyCloudflareCookieHeader(headers, endpoint) {
+  const cookie = endpoint ? cloudflareCookieHeader(endpoint) : null;
+  if (cookie) {
+    headers.cookie = cookie;
+  }
+  return headers;
+}
+
+function buildResponsesHeaders(auth, requestId, sessionId, endpoint = null) {
+  return applyCloudflareCookieHeader(
+    {
+      "accept": "text/event-stream, application/json",
+      "authorization": `Bearer ${auth.accessToken}`,
+      "chatgpt-account-id": auth.accountId,
+      "content-type": "application/json",
+      "originator": "codex_cli_rs",
+      "session-id": sessionId,
+      "thread-id": requestId,
+      "user-agent": codexUserAgent(),
+      "x-client-request-id": requestId,
+    },
+    endpoint
+  );
+}
+
+function buildImageHeaders(auth, endpoint = null) {
+  const headers = {
+    "accept": "application/json",
     "authorization": `Bearer ${auth.accessToken}`,
     "chatgpt-account-id": auth.accountId,
     "content-type": "application/json",
     "originator": "codex_cli_rs",
-    "session_id": sessionId,
-    "user-agent": `codex-imagen/${PACKAGE_VERSION}`,
-    "version": "0.122.0",
-    "x-client-request-id": requestId,
+    "user-agent": codexUserAgent(),
   };
+
+  return applyCloudflareCookieHeader(headers, endpoint);
 }
 
 function buildRefreshHeaders() {
@@ -1236,8 +1534,7 @@ function buildRefreshHeaders() {
     "accept": "application/json",
     "content-type": "application/json",
     "originator": "codex_cli_rs",
-    "user-agent": `codex-imagen/${PACKAGE_VERSION}`,
-    "version": "0.122.0",
+    "user-agent": codexUserAgent(),
   };
 }
 
@@ -1914,7 +2211,7 @@ function backendErrorRetryReason(error) {
 }
 
 function retryReason(error) {
-  if (error instanceof TimeoutError || error instanceof UsageError) {
+  if (error instanceof TimeoutError || error instanceof UsageError || error instanceof StreamError) {
     return null;
   }
 
@@ -1937,6 +2234,9 @@ function retryReason(error) {
     if (seen.has("response.failed")) {
       return "response.failed";
     }
+    if (seen.has("image_response")) {
+      return "image_response_without_data";
+    }
     if (error.seenEventTypes?.some((eventType) => eventType.startsWith("unparsed:"))) {
       return "unparsed_stream_event";
     }
@@ -1958,10 +2258,7 @@ function retryReason(error) {
     return null;
   }
 
-  const text = `${error?.name ?? ""} ${error?.message ?? ""} ${error?.cause?.code ?? ""} ${
-    error?.cause?.message ?? ""
-  }`;
-  if (/\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR|network|fetch failed)\b/i.test(text)) {
+  if (isTransportError(error)) {
     return "transport";
   }
 
@@ -2122,6 +2419,10 @@ async function parseStreamingResponse(response, options, onImageCall, streamStat
     }
   }
 
+  if (!seenEventTypes.has("response.completed")) {
+    throw new StreamError("stream closed before response.completed");
+  }
+
   return {
     imageCalls: [...imageCalls.values()],
     seenEventTypes: [...seenEventTypes],
@@ -2137,6 +2438,72 @@ async function parseJsonResponse(response) {
     seenEventTypes: [payloadType],
     backendErrors: backendErrorsFromPayload(payload, payloadType),
   };
+}
+
+function imageCallsFromImageResponse(payload) {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.data)) {
+    return [];
+  }
+
+  return payload.data
+    .map((item, index) => {
+      const result =
+        typeof item?.b64_json === "string"
+          ? item.b64_json
+          : typeof item?.result === "string"
+            ? item.result
+            : null;
+      if (!result) {
+        return null;
+      }
+      return {
+        type: "image_generation_call",
+        id: typeof item.id === "string" ? item.id : index === 0 ? "image" : `image-${index + 1}`,
+        status: "completed",
+        result,
+        partial: false,
+        revised_prompt:
+          payload.revised_prompt ?? payload.revisedPrompt ?? item.revised_prompt ?? item.revisedPrompt ?? null,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function parseImageResponse(response) {
+  const payload = await response.json();
+  return {
+    imageCalls: imageCallsFromImageResponse(payload),
+    seenEventTypes: ["image_response"],
+    backendErrors: backendErrorsFromPayload(payload, "image_response"),
+    metadata: {
+      created: payload?.created ?? null,
+      background: payload?.background ?? null,
+      quality: payload?.quality ?? null,
+      size: payload?.size ?? null,
+    },
+  };
+}
+
+async function postImageRequest(endpoint, body, auth, signal) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: buildImageHeaders(auth, endpoint),
+    body: JSON.stringify(body),
+    signal,
+  });
+  const cloudflareCookieCount = storeCloudflareCookiesFromResponse(response, endpoint);
+  return { response, cloudflareCookieCount };
+}
+
+async function postResponsesRequest(endpoint, body, auth, requestId, sessionId, signal) {
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: buildResponsesHeaders(auth, requestId, sessionId, endpoint),
+    body: JSON.stringify(body),
+    signal,
+  });
+  const cloudflareCookieCount = storeCloudflareCookiesFromResponse(response, endpoint);
+  return { response, cloudflareCookieCount };
 }
 
 function timestampForPath() {
@@ -2271,17 +2638,29 @@ function createStreamingImageSaver(options) {
   };
 }
 
-function buildResult({ requestId, sessionId, endpoint, model, images, seenEventTypes, timedOut = false }) {
+function buildResult({
+  requestId,
+  sessionId,
+  endpoint,
+  operation,
+  model,
+  images,
+  seenEventTypes,
+  timedOut = false,
+  responseMetadata = null,
+}) {
   return {
     request_id: requestId,
     session_id: sessionId,
     endpoint,
+    operation,
     model,
     image_count: images.length,
     imageCount: images.length,
     images,
     seen_event_types: seenEventTypes,
     timed_out: timedOut,
+    response_metadata: responseMetadata,
   };
 }
 
@@ -2309,7 +2688,7 @@ function createGenerationWatchdog(options, abortController) {
   };
 }
 
-async function requestImage(options, prompt, auth) {
+async function requestHostedImage(options, prompt, auth) {
   const requestId = randomUUID();
   const sessionId = randomUUID();
   const endpoint = `${options.baseUrl.replace(/\/+$/, "")}/responses`;
@@ -2320,16 +2699,31 @@ async function requestImage(options, prompt, auth) {
   const watchdog = createGenerationWatchdog(options, abortController);
 
   logProgress(options, `codex-imagen: POST ${endpoint}`);
+  logProgress(options, "codex-imagen: backend responses");
   logProgress(options, `codex-imagen: model ${options.model}`);
   logVerbose(options, `request_id: ${requestId}`);
 
   try {
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: buildHeaders(auth, requestId, sessionId),
-      body: JSON.stringify(body),
-      signal: abortController.signal,
-    });
+    let { response, cloudflareCookieCount } = await postResponsesRequest(
+      endpoint,
+      body,
+      auth,
+      requestId,
+      sessionId,
+      abortController.signal
+    );
+
+    if (response.status === 403 && cloudflareCookieCount > 0) {
+      logProgress(options, "codex-imagen: retrying with ChatGPT Cloudflare cookies");
+      ({ response } = await postResponsesRequest(
+        endpoint,
+        body,
+        auth,
+        requestId,
+        sessionId,
+        abortController.signal
+      ));
+    }
 
     if (!response.ok) {
       const text = await response.text();
@@ -2362,6 +2756,7 @@ async function requestImage(options, prompt, auth) {
       requestId,
       sessionId,
       endpoint,
+      operation: "responses image_generation",
       model: options.model,
       images,
       seenEventTypes: parsed.seenEventTypes,
@@ -2376,6 +2771,7 @@ async function requestImage(options, prompt, auth) {
         requestId,
         sessionId,
         endpoint,
+        operation: "responses image_generation",
         model: options.model,
         images: streamingSaver.images,
         seenEventTypes: [...streamState.seenEventTypes],
@@ -2389,10 +2785,92 @@ async function requestImage(options, prompt, auth) {
       );
     }
 
+    if (isTransportError(error)) {
+      throw new StreamError(error.message || String(error));
+    }
+
     throw error;
   } finally {
     watchdog.clear();
   }
+}
+
+async function requestTypedImage(options, prompt, auth) {
+  const requestId = randomUUID();
+  const sessionId = randomUUID();
+  const request = await buildImageRequest(options, prompt);
+  const endpoint = `${options.baseUrl.replace(/\/+$/, "")}/${request.path}`;
+  const abortController = new AbortController();
+  const watchdog = createGenerationWatchdog(options, abortController);
+
+  logProgress(options, `codex-imagen: POST ${endpoint}`);
+  logProgress(options, `codex-imagen: operation ${request.operation}`);
+  logProgress(options, `codex-imagen: model ${options.model}`);
+  logVerbose(options, `request_id: ${requestId}`);
+
+  try {
+    let { response, cloudflareCookieCount } = await postImageRequest(
+      endpoint,
+      request.body,
+      auth,
+      abortController.signal
+    );
+
+    if (response.status === 403 && cloudflareCookieCount > 0) {
+      logProgress(options, "codex-imagen: retrying with ChatGPT Cloudflare cookies");
+      ({ response } = await postImageRequest(endpoint, request.body, auth, abortController.signal));
+    }
+
+    if (!response.ok) {
+      const text = await response.text();
+      const preview = text.length > 4000 ? `${text.slice(0, 4000)}...` : text;
+      throw new HttpStatusError(response.status, response.statusText, preview);
+    }
+
+    const parsed = await parseImageResponse(response);
+    const images = await saveImageCallsAtEnd(options, parsed.imageCalls);
+
+    if (images.length === 0) {
+      const backendErrorText = parsed.backendErrors?.length
+        ? `\nBackend error details:\n${formatBackendErrors(parsed.backendErrors)}`
+        : "";
+      throw new GenerationFailedError(
+        `No image data found in Codex Images response. Seen event types: ${parsed.seenEventTypes.join(", ") || "(none)"}${backendErrorText}`,
+        {
+          backendErrors: parsed.backendErrors ?? [],
+          seenEventTypes: parsed.seenEventTypes,
+        }
+      );
+    }
+
+    return buildResult({
+      requestId,
+      sessionId,
+      endpoint,
+      operation: request.operation,
+      model: options.model,
+      images,
+      seenEventTypes: parsed.seenEventTypes,
+      responseMetadata: parsed.metadata,
+    });
+  } catch (error) {
+    if (abortController.signal.aborted) {
+      throw new TimeoutError(
+        `Timed out after ${describeTimeout(options.timeoutMs)} before any image was saved.`
+      );
+    }
+
+    throw error;
+  } finally {
+    watchdog.clear();
+  }
+}
+
+async function requestImage(options, prompt, auth) {
+  if (options.backend === "images") {
+    return requestTypedImage(options, prompt, auth);
+  }
+  return requestHostedImage(options, prompt, auth);
 }
 
 async function requestImageWithRetries(options, prompt, auth) {
@@ -2459,8 +2937,12 @@ function authSummary(auth, options) {
     last_refresh: auth.lastRefresh,
     access_token_expires_in_seconds: tokenSecondsLeft(auth.tokenPayload, auth.expiresMs),
     refresh_token_present: Boolean(auth.refreshToken),
-    endpoint: `${options.baseUrl.replace(/\/+$/, "")}/responses`,
+    backend: options.backend,
+    responses_endpoint: `${options.baseUrl.replace(/\/+$/, "")}/responses`,
+    generation_endpoint: `${options.baseUrl.replace(/\/+$/, "")}/images/generations`,
+    edit_endpoint: `${options.baseUrl.replace(/\/+$/, "")}/images/edits`,
     model: options.model,
+    user_agent: codexUserAgent(),
     out_dir: options.outDir,
     retries: options.retries,
     total_attempts: options.retries + 1,
@@ -2582,6 +3064,11 @@ main().catch((error) => {
   if (error instanceof TimeoutError) {
     console.error(`Error: ${error.message}`);
     process.exitCode = 124;
+    return;
+  }
+  if (error instanceof StreamError) {
+    console.error(`Error: stream error: ${error.message}`);
+    process.exitCode = 1;
     return;
   }
   if (error instanceof GenerationFailedError) {

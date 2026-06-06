@@ -2,9 +2,9 @@
 
 [![CI](https://github.com/darkamenosa/codex-imagen/actions/workflows/ci.yml/badge.svg)](https://github.com/darkamenosa/codex-imagen/actions/workflows/ci.yml)
 
-OpenClaw skill and helper CLI for generating or editing images through the ChatGPT/Codex Responses backend with local OAuth credentials.
+OpenClaw skill and helper CLI for generating or editing images through the ChatGPT/Codex backend with local OAuth credentials.
 
-This calls the native Responses `image_generation` tool at the Codex backend. It does not start `codex app-server`, does not require a Codex binary, does not use the public Images API, and does not require `OPENAI_API_KEY`.
+By default this follows Codex's current hosted image flow: `POST /responses` with the native `image_generation` tool. The standalone typed image endpoints are available for probing with `--backend images`, but Codex source currently gates that path behind the under-development image-generation extension. The helper also preserves ChatGPT Cloudflare cookies for allowed ChatGPT hosts, matching Codex's restricted request client behavior. It does not start `codex app-server`, does not require a Codex binary, and does not require `OPENAI_API_KEY`.
 
 ## Requirements
 
@@ -32,7 +32,7 @@ Generate one image:
 node scripts/codex-imagen.mjs 'generate image follow this prompt, no refine: "a cinematic fantasy city at sunrise"'
 ```
 
-Generate multiple images by asking for them in the prompt. There is no `--count` flag.
+Ask for multiple outputs in the prompt. There is no `--count` flag.
 
 ```bash
 node scripts/codex-imagen.mjs --timeout 900 'generate 3 images follow this prompt, no refine: "three distinct ancient ARPG MMO screenshots"'
@@ -57,7 +57,7 @@ Reference image options:
 - `-i, --image <path>`: attach local image files. Repeat or comma-separate.
 - `--input-ref <path|url>`: attach local paths, `http(s)` URLs, or `data:image/...` URLs. Repeat or comma-separate.
 - `--image-url <url>`: attach an `http(s)` or `data:image/...` URL.
-- `--image-detail <auto|low|high|original>`: set the Responses `input_image.detail` value. Default: `high`.
+- `--image-detail <auto|low|high|original>`: set the Responses `input_image.detail` value. Ignored by `--backend images`. Default: `high`.
 
 Output options:
 
@@ -67,15 +67,16 @@ Output options:
 
 Runtime options:
 
-- `--model <name>`: model slug. Default: `gpt-5.4`.
-- `--retries <count>`: retry transient empty failures this many times. Default: `4`, matching Codex's request retry default of 5 total attempts. Retries apply to network failures, HTTP 5xx, backend `server_error` / overloaded / unavailable responses, and dropped/incomplete streams before any image is saved.
+- `--backend <responses|images>`: Codex image backend. Default: `responses`, matching current Codex hosted `image_generation`. `images` calls the under-development standalone typed endpoint.
+- `--model <name>`: model slug. Defaults: `gpt-5.4` for `responses`, `gpt-image-2` for `images`.
+- `--retries <count>`: retry transient empty failures this many times. Default: `4`, matching Codex's request retry default of 5 total attempts. Retries apply to network failures, HTTP 5xx, backend `server_error` / overloaded / unavailable responses, dropped/incomplete streams before any image is saved, and typed JSON responses without image data.
 - `--no-retry`: disable transient generation retries.
 - `--timeout <seconds>`: abort after this many seconds per generation attempt. Default: `900`, or `300` when an OpenClaw runtime is detected; must be greater than `0`. This is the recommended flag for OpenClaw and other agent usage.
 - `--timeout-seconds <seconds>`: alias for `--timeout`.
 - `--timeout-ms <ms>`: advanced compatibility flag for millisecond timeouts and sub-second tests. Use only one timeout flag per command. After timeout, a hard watchdog forces exit code `124` if the HTTP abort does not settle.
-- `--no-stream`: request a non-streaming response. By default streaming mode saves each image as soon as it arrives.
+- `--no-stream`: request a non-streaming Responses response. The `images` backend is always non-streaming JSON.
 - `--quiet`: suppress progress diagnostics on stderr.
-- `--verbose` or `--debug`: print request progress and raw event names to stderr.
+- `--verbose` or `--debug`: print request progress, raw Responses event names, and reference image details to stderr.
 - `--cwd <path>`: resolve relative input/output paths from this working directory.
 - `--base-url <url>`: Codex backend base URL. Default: `https://chatgpt.com/backend-api/codex`.
 - `--refresh-url <url>`: OAuth refresh endpoint. Default: `https://auth.openai.com/oauth/token`.
@@ -124,7 +125,7 @@ codex-imagen-<timestamp>-<optional-index>-<image-call-id>.png
 - `--output out/` or `--output out` treats the value as a directory and uses automatic filenames.
 - `--out-dir out` always writes automatic filenames under `out`.
 
-In streaming mode, each image is written as soon as it arrives. If a run times out after partial results, already saved images remain on disk and are still printed.
+In the default streaming Responses mode, each image is written as soon as it arrives. If a run times out after partial results, already saved images remain on disk and are still printed. If the hosted Responses stream terminates or closes before `response.completed`, the command follows Codex semantics: already completed images remain saved, but the command exits with a stream error.
 
 ## Auth Lookup
 
@@ -181,6 +182,8 @@ Generation JSON includes:
 - `images[].path` and `images[].decodedPath`
 - `images[].bytes`, `sha256`, `call_id`, `status`, `partial`, `revised_prompt`
 - `seen_event_types`
+- `operation`, for example `responses image_generation`, `image generation`, or `image edit`
+- `response_metadata` for typed Images responses
 - `timed_out`
 - `retry_attempts` and `retryAttempts` when a later retry succeeds
 - `auth_refresh` when refresh happened or was skipped during the run
@@ -207,7 +210,7 @@ node {baseDir}/scripts/codex-imagen.mjs --json --timeout 300 --prompt 'generate 
 
 For prompts that ask for 3 images, prefer `--timeout 600`, or ask for 2 images when the conversation should return quickly. If a multi-image request times out after saving 1 or 2 images, the helper returns those saved paths with `timed_out: true`.
 
-By default the helper also retries transient empty failures with `--retries 4`, so a caller that sets a strict outer OpenClaw `exec.timeout` should budget for retry time or pass `--no-retry`. The helper never retries after streaming has saved an image; partial images are returned instead of duplicating the generation.
+By default the helper also retries transient empty failures with `--retries 4`, so a caller that sets a strict outer OpenClaw `exec.timeout` should budget for retry time or pass `--no-retry`. The helper never retries after streaming has saved an image. Timeouts after saved images return the saved paths; broken hosted Responses streams after saved images leave the files on disk but exit with a stream error, matching Codex turn semantics.
 
 Use `--cwd <path>` when another agent launches this script from an unpredictable working directory.
 
@@ -225,7 +228,7 @@ PowerShell accepts normal quoted strings, but for long prompts `--prompt-file` i
 
 ## Exit Codes
 
-- `0`: success, including a timeout after at least one streaming image was saved
+- `0`: success
 - `1`: generation failed, no image returned, or HTTP error
 - `2`: invalid CLI usage
 - `124`: timed out before any image was saved, or the hard watchdog forced exit after abort did not settle

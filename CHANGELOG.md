@@ -2,7 +2,25 @@
 
 All notable changes to `codex-imagen` are recorded here.
 
-## Unreleased
+## [0.2.7] - 2026-06-06
+
+### Changed
+
+- Restored the Codex-current default backend to hosted Responses `image_generation` at `/responses`.
+- Added `--backend images` / `CODEX_IMAGEN_BACKEND=images` for probing Codex's under-development standalone typed Images endpoints: `/images/generations` and `/images/edits`.
+- Added backend-specific model defaults: `gpt-5.4` for hosted Responses and `gpt-image-2` for typed Images.
+- Updated request headers to use Codex-style `originator: codex_cli_rs` and user-agent values, and added restricted ChatGPT Cloudflare cookie handling for backend requests.
+- Added the `bin/codex-imagen.js` executable wrapper and package `bin` metadata.
+
+### Fixed
+
+- Follow Codex SSE semantics for broken hosted Responses streams: completed image files remain saved, but a later transport termination or stream close before `response.completed` exits with a stream error instead of reporting partial success.
+
+## [0.2.6] - 2026-04-23
+
+### Changed
+
+- Preferred the active OpenClaw `openai-codex` profile for image generation and kept Codex auth fallback discovery.
 
 ## [0.2.5] - 2026-04-23
 

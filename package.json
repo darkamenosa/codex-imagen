@@ -1,8 +1,8 @@
 {
   "name": "codex-imagen",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "private": true,
-  "description": "OpenClaw skill for generating images through ChatGPT/Codex OAuth and the Codex Responses backend.",
+  "description": "OpenClaw skill for generating images through ChatGPT/Codex OAuth and the Codex image_generation backend.",
   "homepage": "https://github.com/darkamenosa/codex-imagen#readme",
   "bugs": {
     "url": "https://github.com/darkamenosa/codex-imagen/issues"
@@ -14,10 +14,10 @@
   "author": "tuyenhx",
   "type": "module",
   "bin": {
-    "codex-imagen": "scripts/codex-imagen.mjs"
+    "codex-imagen": "bin/codex-imagen.js"
   },
   "scripts": {
-    "check": "node --check scripts/codex-imagen.mjs && node scripts/codex-imagen.mjs --version >/dev/null && node scripts/codex-imagen.mjs --help >/dev/null",
+    "check": "node --check scripts/codex-imagen.mjs && node --check bin/codex-imagen.js && node bin/codex-imagen.js --version >/dev/null && node bin/codex-imagen.js --help >/dev/null",
     "test": "node --test scripts/codex-imagen.test.mjs"
   },
   "keywords": [

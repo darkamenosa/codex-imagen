@@ -1,6 +1,6 @@
 ---
 name: codex-imagen
-description: Generate or edit raster images by calling the ChatGPT/Codex Responses image_generation tool directly with local Codex or OpenClaw OAuth credentials, then save decoded image files for OpenClaw and other agent workflows.
+description: Generate or edit raster images by calling the ChatGPT/Codex hosted image_generation flow with local Codex or OpenClaw OAuth credentials, then save decoded image files for OpenClaw and other agent workflows.
 metadata:
   openclaw:
     emoji: "🖼️"
@@ -10,7 +10,7 @@ metadata:
 
 # Codex Imagen
 
-Generate or edit images by calling the ChatGPT/Codex backend directly with OAuth credentials already stored on the machine. This calls the native Responses `image_generation` tool, does not start `codex app-server`, does not need the Codex CLI binary, and does not require `OPENAI_API_KEY`.
+Generate or edit images by calling the ChatGPT/Codex backend directly with OAuth credentials already stored on the machine. By default this follows Codex's current hosted image flow: `POST /responses` with the native `image_generation` tool. The standalone typed image endpoints can be probed with `--backend images`, but Codex source currently gates that path behind the under-development image-generation extension. It does not start `codex app-server`, does not need the Codex CLI binary, and does not require `OPENAI_API_KEY`.
 
 ## Quick Start
 
@@ -34,13 +34,13 @@ Ask for multiple outputs in the prompt. There is no `--count` flag:
 node {baseDir}/scripts/codex-imagen.mjs --timeout 300 -o out/ --prompt 'generate 3 images of a monk mage'
 ```
 
-Use `--verbose` or `--debug` for event-level progress, and `--quiet` when only stdout paths/JSON should be emitted.
+Use `--verbose` or `--debug` for request progress, raw Responses event names, and reference image details. Use `--quiet` when only stdout paths/JSON should be emitted.
 
 ## Retry Behavior
 
-The helper retries transient empty failures by default: network errors, HTTP 5xx responses, backend `server_error` / overloaded / unavailable responses, and dropped/incomplete streams that end before a completed image arrives. Default is `--retries 4`, meaning 5 total attempts, matching Codex's request retry shape.
+The helper retries transient empty failures by default: network errors, HTTP 5xx responses, backend `server_error` / overloaded / unavailable responses, dropped/incomplete streams before any image is saved, and typed JSON responses without image data. Default is `--retries 4`, meaning 5 total attempts, matching Codex's request retry shape.
 
-Retries are intentionally not used for usage errors, auth errors, policy/input errors, rate limits, generation timeouts, or after an image has already been saved. If streaming saves partial images and then times out, the helper returns those saved paths instead of starting a duplicate generation. The `--timeout` value applies per generation attempt, so an outer OpenClaw `exec.timeout` must budget for retries when retries are enabled.
+Retries are intentionally not used for usage errors, auth errors, policy/input errors, rate limits, generation timeouts, stream errors, or after an image has already been saved. If streaming saves partial images and then times out, the helper returns those saved paths instead of starting a duplicate generation. If the hosted Responses stream terminates or closes before `response.completed`, already completed images remain saved but the command exits with a stream error, matching Codex turn semantics. The `--timeout` value applies per generation attempt, so an outer OpenClaw `exec.timeout` must budget for retries when retries are enabled.
 
 Use `--no-retry` or `--retries 0` when an outer caller owns retry behavior.
 
@@ -61,7 +61,7 @@ Image generation can be slow, especially when the prompt asks for multiple image
 
 ## Auth Discovery
 
-The CLI reads existing OAuth JSON and sends `Authorization: Bearer <access>` plus `ChatGPT-Account-Id` to `https://chatgpt.com/backend-api/codex/responses`.
+The CLI reads existing OAuth JSON and sends `Authorization: Bearer <access>`, `ChatGPT-Account-Id`, `originator: codex_cli_rs`, Codex-style request metadata, and a Codex-style user agent to `https://chatgpt.com/backend-api/codex/responses` by default.
 
 Run a local auth check without generating:
 
@@ -110,7 +110,7 @@ When `--out-dir` is not set, the script chooses the first available location:
 4. `OPENCLAW_STATE_DIR/artifacts/codex-imagen`
 5. `./codex-imagen-output`
 
-Streaming is enabled by default and saves each image as soon as it arrives. If a run times out after partial results, already received images remain saved and are printed. Use `--timeout 300` for chat-facing OpenClaw calls unless the user explicitly asks for a longer run, or `--no-stream` to request a non-streaming response.
+Streaming is enabled by default and saves each image as soon as it arrives. If a run times out after partial results, already received images remain saved and are printed. If the stream breaks before `response.completed`, already completed images remain saved but the command fails with a stream error. Use `--timeout 300` for chat-facing OpenClaw calls unless the user explicitly asks for a longer run, or `--no-stream` to request a non-streaming Responses response.
 
 ## Reference Images
 
@@ -122,7 +122,7 @@ node {baseDir}/scripts/codex-imagen.mjs -i ref1.png -i ref2.jpg --prompt 'change
 node {baseDir}/scripts/codex-imagen.mjs --image-url 'https://example.com/ref.png' --prompt 'use this image as the world reference'
 ```
 
-Local images are converted to `data:image/...;base64,...` and sent as `input_image` items. `--input-ref` accepts local paths, `http(s)` URLs, and `data:image/...` URLs. `-i/--image` is local-only, and `--image-url` is URL/data-URL only. Supported local formats are PNG, JPEG, GIF, and WebP. Use `--image-detail auto|low|high|original` when the model should receive lower or higher image detail; default is `high`. Use smaller JPEG references when high-fidelity pixel detail is not needed.
+Local images are converted to `data:image/...;base64,...` and sent as Responses `input_image` items by default. `--input-ref` accepts local paths, `http(s)` URLs, and `data:image/...` URLs. `-i/--image` is local-only, and `--image-url` is URL/data-URL only. Supported local formats are PNG, JPEG, GIF, and WebP. Use `--image-detail auto|low|high|original` when the model should receive lower or higher image detail; default is `high`. Use smaller JPEG references when high-fidelity pixel detail is not needed.
 
 ## OAuth Refresh
 

@@ -68,6 +68,12 @@ async function runCli(args, env = {}) {
   return { code, stdout, stderr };
 }
 
+const deterministicCodexUserAgentEnv = {
+  CODEX_IMAGEN_CODEX_VERSION: "9.8.7-test",
+  TERM_PROGRAM: "iTerm.app",
+  TERM_PROGRAM_VERSION: "3.6.11",
+};
+
 test("smoke prefers OpenClaw configured openai-codex profile over default", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-active-openclaw-profile-"));
   const stateDir = path.join(tempDir, "state");
@@ -245,6 +251,314 @@ function writeImageGenerationResponse(response) {
   response.write(`data: ${JSON.stringify({ type: "response.completed" })}\n\n`);
   response.end();
 }
+
+function writeInterruptedImageGenerationResponse(response) {
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+  response.writeHead(200, { "content-type": "text/event-stream" });
+  response.write(
+    `data: ${JSON.stringify({
+      type: "response.output_item.done",
+      item: {
+        type: "image_generation_call",
+        id: "ig_saved",
+        status: "completed",
+        result: png,
+      },
+    })}\n\n`
+  );
+  response.write(
+    `data: ${JSON.stringify({
+      type: "response.image_generation_call.generating",
+      item_id: "ig_next",
+    })}\n\n`
+  );
+  response.flushHeaders?.();
+  setTimeout(() => response.destroy(new Error("test stream interruption")), 25);
+}
+
+function writeTypedImageGenerationResponse(response) {
+  const png =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(
+    JSON.stringify({
+      created: 1778832973,
+      data: [{ b64_json: png }],
+      background: "auto",
+      quality: "auto",
+      size: "auto",
+    })
+  );
+}
+
+async function readJsonBody(request) {
+  let raw = "";
+  for await (const chunk of request) {
+    raw += chunk;
+  }
+  return raw ? JSON.parse(raw) : null;
+}
+
+function freshOpenClawProfile() {
+  return {
+    type: "oauth",
+    provider: "openai-codex",
+    access: jwtWithExpiry(Date.now() + 60 * 60_000),
+    refresh: "fresh-refresh-token",
+    expires: Date.now() + 60 * 60_000,
+    accountId: "acct_test",
+  };
+}
+
+test("generation defaults to hosted Responses image_generation request", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-responses-generate-"));
+  const authPath = path.join(tempDir, "agent", "auth-profiles.json");
+  const outDir = path.join(tempDir, "out");
+  await writeOpenClawAuthProfile(authPath, freshOpenClawProfile());
+
+  const seen = [];
+  const server = createServer(async (request, response) => {
+    if (request.url === "/backend-api/codex/responses") {
+      seen.push({
+        method: request.method,
+        headers: request.headers,
+        body: await readJsonBody(request),
+      });
+      writeImageGenerationResponse(response);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const result = await runCli(
+      [
+        "--auth",
+        authPath,
+        "--base-url",
+        `http://127.0.0.1:${port}/backend-api/codex`,
+        "--out-dir",
+        outDir,
+        "--json",
+        "--quiet",
+        "--prompt",
+        "paint a moonlit lake",
+      ],
+      { OPENCLAW_STATE_DIR: path.join(tempDir, "state"), ...deterministicCodexUserAgentEnv }
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].method, "POST");
+    assert.equal(seen[0].headers.originator, "codex_cli_rs");
+    assert.equal(seen[0].headers["chatgpt-account-id"], "acct_test");
+    assert.match(seen[0].headers["user-agent"], /^codex_cli_rs\/9\.8\.7-test \(.+; .+\) iTerm\.app\/3\.6\.11$/);
+    assert.equal(seen[0].headers["session-id"]?.length, 36);
+    assert.equal(seen[0].headers["thread-id"]?.length, 36);
+    assert.equal(seen[0].headers["x-client-request-id"], seen[0].headers["thread-id"]);
+    assert.equal(seen[0].headers.session_id, undefined);
+    assert.equal(seen[0].headers.version, undefined);
+    assert.equal(seen[0].body.model, "gpt-5.4");
+    assert.deepEqual(seen[0].body.tools, [{ type: "image_generation", output_format: "png" }]);
+    assert.equal(seen[0].body.stream, true);
+    assert.equal(seen[0].body.input[0].content.at(-1).text, "paint a moonlit lake");
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.operation, "responses image_generation");
+    assert.equal(output.image_count, 1);
+    assert.deepEqual(output.seen_event_types, ["response.output_item.done", "response.completed"]);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("interrupted Responses stream fails but leaves already saved images", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-interrupted-responses-"));
+  const authPath = path.join(tempDir, "agent", "auth-profiles.json");
+  const outDir = path.join(tempDir, "out");
+  await writeOpenClawAuthProfile(authPath, freshOpenClawProfile());
+
+  const server = createServer(async (request, response) => {
+    if (request.url === "/backend-api/codex/responses") {
+      await readJsonBody(request);
+      writeInterruptedImageGenerationResponse(response);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const result = await runCli(
+      [
+        "--auth",
+        authPath,
+        "--base-url",
+        `http://127.0.0.1:${port}/backend-api/codex`,
+        "--out-dir",
+        outDir,
+        "--json",
+        "--quiet",
+        "--retries",
+        "0",
+        "--prompt",
+        "paint a moonlit lake",
+      ],
+      { OPENCLAW_STATE_DIR: path.join(tempDir, "state"), ...deterministicCodexUserAgentEnv }
+    );
+
+    assert.equal(result.code, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /Error: stream error: terminated/);
+    const savedFiles = await fs.readdir(outDir);
+    assert.equal(savedFiles.length, 1);
+    assert.match(savedFiles[0], /^codex-imagen-\d{8}-\d{6}Z-1-ig_saved\.png$/);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("generation posts Codex typed images request", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-typed-generate-"));
+  const authPath = path.join(tempDir, "agent", "auth-profiles.json");
+  const outDir = path.join(tempDir, "out");
+  await writeOpenClawAuthProfile(authPath, freshOpenClawProfile());
+
+  const seen = [];
+  const server = createServer(async (request, response) => {
+    if (request.url === "/backend-api/codex/images/generations") {
+      seen.push({
+        method: request.method,
+        headers: request.headers,
+        body: await readJsonBody(request),
+      });
+      writeTypedImageGenerationResponse(response);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const result = await runCli(
+      [
+        "--auth",
+        authPath,
+        "--base-url",
+        `http://127.0.0.1:${port}/backend-api/codex`,
+        "--backend",
+        "images",
+        "--out-dir",
+        outDir,
+        "--json",
+        "--quiet",
+        "--prompt",
+        "paint a moonlit lake",
+      ],
+      { OPENCLAW_STATE_DIR: path.join(tempDir, "state"), ...deterministicCodexUserAgentEnv }
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].method, "POST");
+    assert.equal(seen[0].headers.originator, "codex_cli_rs");
+    assert.equal(seen[0].headers["chatgpt-account-id"], "acct_test");
+    assert.match(seen[0].headers["user-agent"], /^codex_cli_rs\/9\.8\.7-test \(.+; .+\) iTerm\.app\/3\.6\.11$/);
+    assert.deepEqual(seen[0].body, {
+      prompt: "paint a moonlit lake",
+      background: "auto",
+      model: "gpt-image-2",
+      quality: "auto",
+      size: "auto",
+    });
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.operation, "image generation");
+    assert.equal(output.image_count, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("reference image posts Codex typed image edit request", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-typed-edit-"));
+  const authPath = path.join(tempDir, "agent", "auth-profiles.json");
+  const outDir = path.join(tempDir, "out");
+  const refPath = path.join(tempDir, "ref.png");
+  await writeOpenClawAuthProfile(authPath, freshOpenClawProfile());
+  await fs.writeFile(
+    refPath,
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+      "base64"
+    )
+  );
+
+  const seen = [];
+  const server = createServer(async (request, response) => {
+    if (request.url === "/backend-api/codex/images/edits") {
+      seen.push({
+        method: request.method,
+        headers: request.headers,
+        body: await readJsonBody(request),
+      });
+      writeTypedImageGenerationResponse(response);
+      return;
+    }
+    response.writeHead(404);
+    response.end();
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  try {
+    const result = await runCli(
+      [
+        "--auth",
+        authPath,
+        "--base-url",
+        `http://127.0.0.1:${port}/backend-api/codex`,
+        "--backend",
+        "images",
+        "--out-dir",
+        outDir,
+        "--image",
+        refPath,
+        "--json",
+        "--quiet",
+        "--prompt",
+        "add a red hat",
+      ],
+      { OPENCLAW_STATE_DIR: path.join(tempDir, "state") }
+    );
+
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].method, "POST");
+    assert.deepEqual(Object.keys(seen[0].body).sort(), [
+      "background",
+      "images",
+      "model",
+      "prompt",
+      "quality",
+      "size",
+    ]);
+    assert.equal(seen[0].body.prompt, "add a red hat");
+    assert.equal(seen[0].body.model, "gpt-image-2");
+    assert.equal(seen[0].body.background, "auto");
+    assert.equal(seen[0].body.quality, "auto");
+    assert.equal(seen[0].body.size, "auto");
+    assert.equal(seen[0].body.images.length, 1);
+    assert.match(seen[0].body.images[0].image_url, /^data:image\/png;base64,/);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.operation, "image edit");
+    assert.equal(output.image_count, 1);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
 
 test("refresh-only retries once with a rotated refresh token after refresh_token_reused", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-imagen-refresh-reused-"));
