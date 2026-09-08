@@ -1691,7 +1691,19 @@ function mergeRefreshResponseForAuth(currentAuth, refreshResponse) {
   return nextAuthJson;
 }
 
+function isAllowedRefreshUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && /(^|\.)openai\.com$/i.test(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
 async function postRefreshRequest(options, refreshToken) {
+  if (!isAllowedRefreshUrl(options.refreshUrl)) {
+    throw new Error(`Refusing to use untrusted OAuth refresh endpoint: ${options.refreshUrl}`);
+  }
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), OAUTH_REFRESH_CALL_TIMEOUT_MS);
   try {
