@@ -9,7 +9,7 @@ import process from "node:process";
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const DEFAULT_REFRESH_URL = "https://auth.openai.com/oauth/token";
 const DEFAULT_BACKEND = "responses";
-const DEFAULT_RESPONSES_MODEL = "gpt-5.4";
+const DEFAULT_RESPONSES_MODEL = "gpt-5.6-luna";
 const DEFAULT_IMAGES_MODEL = "gpt-image-2";
 const DEFAULT_IMAGE_BACKGROUND = "auto";
 const DEFAULT_IMAGE_QUALITY = "auto";
@@ -17,7 +17,7 @@ const DEFAULT_IMAGE_SIZE = "auto";
 const DEFAULT_OPENCLAW_AGENT_ID = "main";
 const DEFAULT_CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 const PACKAGE_VERSION = "0.2.7";
-const DEFAULT_CODEX_USER_AGENT_VERSION = "0.137.0";
+const DEFAULT_CODEX_USER_AGENT_VERSION = "0.153.2";
 const CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_REFRESH_SKEW_SECONDS = 5 * 60;
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -1340,44 +1340,15 @@ function codexOsInfo() {
   return `${process.platform} ${os.release()}`;
 }
 
-function terminalUserAgent() {
-  const termProgram = process.env.TERM_PROGRAM?.trim();
-  if (termProgram) {
-    const version = process.env.TERM_PROGRAM_VERSION?.trim();
-    return sanitizeUserAgentPart(version ? `${termProgram}/${version}` : termProgram);
-  }
-
-  const term = process.env.TERM?.trim();
-  return sanitizeUserAgentPart(term || "unknown");
-}
-
 function codexUserAgentVersion() {
   const explicit = process.env.CODEX_IMAGEN_CODEX_VERSION?.trim();
-  if (explicit) {
-    return sanitizeUserAgentPart(explicit, DEFAULT_CODEX_USER_AGENT_VERSION);
-  }
-
-  try {
-    const output = execFileSync("codex", ["--version"], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 1000,
-    }).trim();
-    const match = output.match(/\b(?:codex-cli|codex)\s+([^\s]+)/i);
-    if (match?.[1]) {
-      return sanitizeUserAgentPart(match[1], DEFAULT_CODEX_USER_AGENT_VERSION);
-    }
-  } catch {
-    // Fall through to the version observed from the local Codex install.
-  }
-
-  return DEFAULT_CODEX_USER_AGENT_VERSION;
+  return sanitizeUserAgentPart(explicit || DEFAULT_CODEX_USER_AGENT_VERSION, DEFAULT_CODEX_USER_AGENT_VERSION);
 }
 
 function codexUserAgent() {
   const platform = `${codexOsInfo()}; ${os.arch()}`;
   return sanitizeUserAgentPart(
-    `codex_cli_rs/${codexUserAgentVersion()} (${platform}) ${terminalUserAgent()}`,
+    `codex_cli_rs/${codexUserAgentVersion()} (${platform}) unknown`,
     "codex_cli_rs"
   );
 }
@@ -1507,6 +1478,7 @@ function buildResponsesHeaders(auth, requestId, sessionId, endpoint = null) {
       "chatgpt-account-id": auth.accountId,
       "content-type": "application/json",
       "originator": "codex_cli_rs",
+      "version": codexUserAgentVersion(),
       "session-id": sessionId,
       "thread-id": requestId,
       "user-agent": codexUserAgent(),
@@ -1518,6 +1490,7 @@ function buildResponsesHeaders(auth, requestId, sessionId, endpoint = null) {
 
 function buildImageHeaders(auth, endpoint = null) {
   const headers = {
+    "version": codexUserAgentVersion(),
     "accept": "application/json",
     "authorization": `Bearer ${auth.accessToken}`,
     "chatgpt-account-id": auth.accountId,
@@ -1531,6 +1504,7 @@ function buildImageHeaders(auth, endpoint = null) {
 
 function buildRefreshHeaders() {
   return {
+    "version": codexUserAgentVersion(),
     "accept": "application/json",
     "content-type": "application/json",
     "originator": "codex_cli_rs",

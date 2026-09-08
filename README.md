@@ -68,7 +68,7 @@ Output options:
 Runtime options:
 
 - `--backend <responses|images>`: Codex image backend. Default: `responses`, matching current Codex hosted `image_generation`. `images` calls the under-development standalone typed endpoint.
-- `--model <name>`: model slug. Defaults: `gpt-5.4` for `responses`, `gpt-image-2` for `images`.
+- `--model <name>`: model slug. Defaults: `gpt-5.6-luna` for `responses`, `gpt-image-2` for `images`.
 - `--retries <count>`: retry transient empty failures this many times. Default: `4`, matching Codex's request retry default of 5 total attempts. Retries apply to network failures, HTTP 5xx, backend `server_error` / overloaded / unavailable responses, dropped/incomplete streams before any image is saved, and typed JSON responses without image data.
 - `--no-retry`: disable transient generation retries.
 - `--timeout <seconds>`: abort after this many seconds per generation attempt. Default: `900`, or `300` when an OpenClaw runtime is detected; must be greater than `0`. This is the recommended flag for OpenClaw and other agent usage.

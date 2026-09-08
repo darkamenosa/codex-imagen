@@ -63,6 +63,18 @@ Image generation can be slow, especially when the prompt asks for multiple image
 
 The CLI reads existing OAuth JSON and sends `Authorization: Bearer <access>`, `ChatGPT-Account-Id`, `originator: codex_cli_rs`, Codex-style request metadata, and a Codex-style user agent to `https://chatgpt.com/backend-api/codex/responses` by default.
 
+The Responses model defaults to `gpt-5.6-luna`; the Images backend defaults to `gpt-image-2`.
+
+### Agent headers
+
+```http
+originator: codex_cli_rs
+version: 0.153.2
+user-agent: codex_cli_rs/0.153.2 (<OS> <release>; <arch>) unknown
+```
+
+OS, release, and architecture are detected locally. `CODEX_IMAGEN_CODEX_VERSION` overrides the version in both headers. The installed Codex CLI and terminal environment do not change these defaults.
+
 Run a local auth check without generating:
 
 ```bash
