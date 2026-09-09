@@ -2,6 +2,13 @@
 
 All notable changes to `codex-imagen` are recorded here.
 
+## [0.2.8] - 2026-09-09
+
+### Changed
+
+- Updated the default Responses model to `gpt-5.6-luna`.
+- Aligned Codex request headers with agent version `0.153.2`, including a stable `version` header and user-agent format.
+
 ## [0.2.7] - 2026-06-06
 
 ### Changed

@@ -1,6 +1,6 @@
 {
   "name": "codex-imagen",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "private": true,
   "description": "OpenClaw skill for generating images through ChatGPT/Codex OAuth and the Codex image_generation backend.",
   "homepage": "https://github.com/darkamenosa/codex-imagen#readme",
