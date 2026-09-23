@@ -355,13 +355,13 @@ test("generation defaults to hosted Responses image_generation request", async (
     assert.equal(seen[0].method, "POST");
     assert.equal(seen[0].headers.originator, "codex_cli_rs");
     assert.equal(seen[0].headers["chatgpt-account-id"], "acct_test");
-    assert.match(seen[0].headers["user-agent"], /^codex_cli_rs\/0\.153\.2 \(.+; .+\) unknown$/);
+    assert.match(seen[0].headers["user-agent"], /^codex_cli_rs\/0\.156\.1 \(.+; .+\) unknown$/);
     assert.equal(seen[0].headers["session-id"]?.length, 36);
     assert.equal(seen[0].headers["thread-id"]?.length, 36);
     assert.equal(seen[0].headers["x-client-request-id"], seen[0].headers["thread-id"]);
     assert.equal(seen[0].headers.session_id, undefined);
-    assert.equal(seen[0].headers.version, "0.153.2");
-    assert.equal(seen[0].body.model, "gpt-5.6-luna");
+    assert.equal(seen[0].headers.version, "0.156.1");
+    assert.equal(seen[0].body.model, "gpt-6-luna");
     assert.deepEqual(seen[0].body.tools, [{ type: "image_generation", output_format: "png" }]);
     assert.equal(seen[0].body.stream, true);
     assert.equal(seen[0].body.input[0].content.at(-1).text, "paint a moonlit lake");
